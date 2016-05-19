@@ -85,6 +85,12 @@ class BaseVmSpec(spec.BaseSpec):
     image: The disk image to boot from.
     install_packages: If false, no packages will be installed. This is
         useful if benchmark dependencies have already been installed.
+    background_cpu_threads: The number of threads of background CPU usage
+        while running the benchmark.
+    background_network_mbits_per_sec: The number of megabits per second of
+        background network traffic during the benchmark.
+    background_network_ip_type: The IP address type (INTERNAL or
+        EXTERNAL) to use for generating background network workload.
   """
 
   __metaclass__ = AutoRegisterVmSpecMeta
@@ -113,6 +119,15 @@ class BaseVmSpec(spec.BaseSpec):
       config_values['install_packages'] = flag_values.install_packages
     if flag_values['machine_type'].present:
       config_values['machine_type'] = flag_values.machine_type
+    if flag_values['background_cpu_threads'].present:
+      config_values['background_cpu_threads'] = (
+          flag_values.background_cpu_threads)
+    if flag_values['background_network_mbits_per_sec'].present:
+      config_values['background_network_mbits_per_sec'] = (
+          flag_values.background_network_mbits_per_sec)
+    if flag_values['background_network_ip_type'].present:
+      config_values['background_network_ip_type'] = (
+          flag_values.background_network_ip_type)
 
   @classmethod
   def _GetOptionDecoderConstructions(cls):
@@ -134,7 +149,15 @@ class BaseVmSpec(spec.BaseSpec):
         'machine_type': (option_decoders.StringDecoder, {'none_ok': True,
                                                          'default': None}),
         'zone': (option_decoders.StringDecoder, {'none_ok': True,
-                                                 'default': None})})
+                                                 'default': None}),
+        'background_network_mbits_per_sec': (option_decoders.IntDecoder, {
+            'none_ok': True, 'default': None}),
+        'background_network_ip_type': (option_decoders.EnumDecoder, {
+            'default': vm_util.IpAddressSubset.EXTERNAL,
+            'valid_values': [vm_util.IpAddressSubset.EXTERNAL,
+                             vm_util.IpAddressSubset.INTERNAL]}),
+        'background_cpu_threads': (option_decoders.IntDecoder, {
+            'none_ok': True, 'default': None})})
     return result
 
 
@@ -148,7 +171,7 @@ class BaseVirtualMachine(resource.BaseResource):
   Attributes:
     image: The disk image used to boot.
     internal_ip: Internal IP address.
-    ip: Public (external) IP address.
+    ip_address: Public (external) IP address.
     machine_type: The provider-specific instance type (e.g. n1-standard-8).
     project: The provider-specific project associated with the VM (e.g.
       artisanal-lightbulb-883).
@@ -162,6 +185,12 @@ class BaseVirtualMachine(resource.BaseResource):
     scratch_disks: list of BaseDisk objects. Scratch disks attached to the VM.
     max_local_disks: The number of local disks on the VM that can be used as
       scratch disks or that can be striped together.
+    background_cpu_threads: The number of threads of background CPU usage
+      while running the benchmark.
+    background_network_mbits_per_sec: Number of mbits/sec of background network
+      usage while running the benchmark.
+    background_network_ip_type: Type of IP address to use for generating
+      background network workload
   """
 
   __metaclass__ = AutoRegisterVmMeta
@@ -197,6 +226,10 @@ class BaseVirtualMachine(resource.BaseResource):
     self.max_local_disks = 0
     self.local_disk_counter = 0
     self.remote_disk_counter = 0
+    self.background_cpu_threads = vm_spec.background_cpu_threads
+    self.background_network_mbits_per_sec = (
+        vm_spec.background_network_mbits_per_sec)
+    self.background_network_ip_type = vm_spec.background_network_ip_type
 
     self.network = None
     self.firewall = None
@@ -412,15 +445,16 @@ class BaseOsMixin(object):
     """
     self.RemoteCopy(source_path, remote_path)
 
-  def PullFile(self, source_path, remote_path=''):
-    """Copies a file or a directory from the VM.
+  def PullFile(self, local_path, remote_path):
+    """Copies a file or a directory from the VM to the local machine.
 
     Args:
-      source_path: The location of the file or directory on the REMOTE machine.
-      remote_path: The destination of the file on the LOCAL machine, default
-          is the home directory.
+      local_path: string. The destination path of the file or directory on the
+          local machine.
+      remote_path: string. The source path of the file or directory on the
+          remote machine.
     """
-    self.RemoteCopy(source_path, remote_path, copy_to=False)
+    self.RemoteCopy(local_path, remote_path, copy_to=False)
 
   def PushDataFile(self, data_file, remote_path=''):
     """Upload a file in perfkitbenchmarker.data directory to the VM.
@@ -542,3 +576,18 @@ class BaseOsMixin(object):
   def _TestReachable(self, ip):
     """Returns True if the VM can reach the ip address and False otherwise."""
     raise NotImplementedError()
+
+  def StartBackgroundWorkload(self):
+    """Start the background workload"""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()
+
+  def StopBackgroundWorkload(self):
+    """Stop the background workoad"""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()
+
+  def PrepareBackgroundWorkload(self):
+    """Prepare for the background workload"""
+    if self.background_cpu_threads or self.background_network_mbits_per_sec:
+      raise NotImplementedError()

@@ -20,7 +20,6 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
 from perfkitbenchmarker import disk
 from perfkitbenchmarker.providers.openstack import utils as os_utils
-from perfkitbenchmarker.providers.openstack.utils import retry_authorization
 
 FLAGS = flags.FLAGS
 
@@ -35,7 +34,7 @@ class OpenStackDisk(disk.BaseDisk):
         self.image = image
         self.name = name
         self.zone = zone
-        self.device = ""
+        self.device = None
         self._disk = None
 
     def _Create(self):
@@ -53,7 +52,6 @@ class OpenStackDisk(disk.BaseDisk):
                 is_unavailable = not (volume.status == "available")
                 self._disk = volume
 
-    @retry_authorization(max_retries=4)
     def _Delete(self):
         from novaclient.exceptions import NotFound
 
@@ -92,7 +90,8 @@ class OpenStackDisk(disk.BaseDisk):
         self.attached_vm_id = vm.id
 
         result = self.__nclient.volumes.create_server_volume(vm.id,
-                                                             self._disk.id,)
+                                                             self._disk.id,
+                                                             self.device)
         self.attach_id = result.id
 
         volume = None

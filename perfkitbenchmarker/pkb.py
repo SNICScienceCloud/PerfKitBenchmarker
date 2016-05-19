@@ -63,7 +63,6 @@ import sys
 import uuid
 
 from perfkitbenchmarker import archive
-from perfkitbenchmarker import linux_benchmarks
 from perfkitbenchmarker import benchmark_sets
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import benchmark_status
@@ -72,21 +71,20 @@ from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import events
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import linux_benchmarks
 from perfkitbenchmarker import log_util
+from perfkitbenchmarker import os_types
+from perfkitbenchmarker import requirements
+from perfkitbenchmarker import stages
 from perfkitbenchmarker import static_virtual_machine
 from perfkitbenchmarker import timing_util
 from perfkitbenchmarker import traces
 from perfkitbenchmarker import version
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import windows_benchmarks
+from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.publisher import SampleCollector
 
-STAGE_ALL = 'all'
-STAGE_PROVISION = 'provision'
-STAGE_PREPARE = 'prepare'
-STAGE_RUN = 'run'
-STAGE_CLEANUP = 'cleanup'
-STAGE_TEARDOWN = 'teardown'
 LOG_FILE_NAME = 'pkb.log'
 REQUIRED_INFO = ['scratch_disk', 'num_machines']
 REQUIRED_EXECUTABLES = frozenset(['ssh', 'ssh-keygen', 'scp', 'openssl'])
@@ -103,7 +101,7 @@ flags.DEFINE_string('archive_bucket', None,
 flags.DEFINE_string('project', None, 'GCP project ID under which '
                     'to create the virtual machines')
 flags.DEFINE_list(
-    'zones', None,
+    'zones', [],
     'A list of zones within which to run PerfKitBenchmarker. '
     'This is specific to the cloud provider you are running o`n. '
     'If multiple zones are given, PerfKitBenchmarker will create 1 VM in '
@@ -132,11 +130,6 @@ flags.DEFINE_enum(
 flags.DEFINE_enum(
     'file_log_level', log_util.DEBUG, [log_util.DEBUG, log_util.INFO],
     'Anything logged at this level or higher will be written to the log file.')
-flags.DEFINE_enum(
-    'run_stage', STAGE_ALL,
-    [STAGE_ALL, STAGE_PROVISION, STAGE_PREPARE,
-     STAGE_RUN, STAGE_CLEANUP, STAGE_TEARDOWN],
-    'The stage of perfkitbenchmarker to run. By default it runs all stages.')
 flags.DEFINE_integer('duration_in_seconds', None,
                      'duration of benchmarks. '
                      '(only valid for mesh_benchmark)')
@@ -180,6 +173,10 @@ flags.DEFINE_bool(
     'execution ends. When False, benchmarks continue to be scheduled. Does not '
     'apply to keyboard interrupts, which will always prevent further '
     'benchmarks from being scheduled.')
+flags.DEFINE_boolean(
+    'ignore_package_requirements', False,
+    'Disables Python package requirement runtime checks.')
+
 
 # Support for using a proxy in the cloud environment.
 flags.DEFINE_string('http_proxy', '',
@@ -198,6 +195,116 @@ MAX_RUN_URI_LENGTH = 8
 events.initialization_complete.connect(traces.RegisterAll)
 
 
+def _InjectBenchmarkInfoIntoDocumentation():
+  """Appends each benchmark's information to the main module's docstring."""
+  # TODO: Verify if there is other way of appending additional help
+  # message.
+  # Inject more help documentation
+  # The following appends descriptions of the benchmarks and descriptions of
+  # the benchmark sets to the help text.
+  benchmark_sets_list = [
+      '%s:  %s' %
+      (set_name, benchmark_sets.BENCHMARK_SETS[set_name]['message'])
+      for set_name in benchmark_sets.BENCHMARK_SETS]
+  sys.modules['__main__'].__doc__ = (
+      'PerfKitBenchmarker version: {version}\n\n{doc}\n'
+      'Benchmarks (default requirements):\n'
+      '\t{benchmark_doc}').format(
+          version=version.VERSION,
+          doc=__doc__,
+          benchmark_doc=_GenerateBenchmarkDocumentation())
+  sys.modules['__main__'].__doc__ += ('\n\nBenchmark Sets:\n\t%s'
+                                      % '\n\t'.join(benchmark_sets_list))
+
+
+def _ParseFlags(argv=sys.argv):
+  """Parses the command-line flags."""
+  try:
+    argv = FLAGS(argv)
+  except flags.FlagsError as e:
+    logging.error('%s\nUsage: %s ARGS\n%s', e, sys.argv[0], FLAGS)
+    sys.exit(1)
+
+
+def CheckVersionFlag():
+  """If the --version flag was specified, prints the version and exits."""
+  if FLAGS.version:
+    print version.VERSION
+    sys.exit(0)
+
+
+def _InitializeRunUri():
+  """Determines the PKB run URI and sets FLAGS.run_uri."""
+  if FLAGS.run_uri is None:
+    if stages.PROVISION in FLAGS.run_stage:
+      FLAGS.run_uri = str(uuid.uuid4())[-8:]
+    else:
+      # Attempt to get the last modified run directory.
+      run_uri = vm_util.GetLastRunUri()
+      if run_uri:
+        FLAGS.run_uri = run_uri
+        logging.warning(
+            'No run_uri specified. Attempting to run the following stages with '
+            '--run_uri=%s: %s', FLAGS.run_uri, ', '.join(FLAGS.run_stage))
+      else:
+        raise errors.Setup.NoRunURIError(
+            'No run_uri specified. Could not run the following stages: %s' %
+            ', '.join(FLAGS.run_stage))
+  elif not FLAGS.run_uri.isalnum() or len(FLAGS.run_uri) > MAX_RUN_URI_LENGTH:
+    raise errors.Setup.BadRunURIError('run_uri must be alphanumeric and less '
+                                      'than or equal to 8 characters in '
+                                      'length.')
+
+
+def _CreateBenchmarkRunList():
+  """Create a list of configs and states for each benchmark run to be scheduled.
+
+  Returns:
+    list of (args, run_status_list) pairs. Contains one pair per benchmark run
+    to be scheduled, including multiple pairs for benchmarks that will be run
+    multiple times. args is a tuple of the first five arguments to pass to
+    RunBenchmark, and run_status_list is a list of strings in the order of
+    [benchmark_name, benchmark_uid, benchmark_status].
+  """
+  result = []
+  benchmark_tuple_list = benchmark_sets.GetBenchmarksFromFlags()
+  total_benchmarks = len(benchmark_tuple_list)
+  benchmark_counts = collections.defaultdict(itertools.count)
+  for i, benchmark_tuple in enumerate(benchmark_tuple_list):
+    # Construct benchmark config object.
+    benchmark_module, user_config = benchmark_tuple
+    name = benchmark_module.BENCHMARK_NAME
+    expected_os_types = (
+        os_types.WINDOWS_OS_TYPES if FLAGS.os_type in os_types.WINDOWS_OS_TYPES
+        else os_types.LINUX_OS_TYPES)
+    config_dict = benchmark_module.GetConfig(user_config)
+    config_spec_class = getattr(
+        benchmark_module, 'BENCHMARK_CONFIG_SPEC_CLASS',
+        benchmark_config_spec.BenchmarkConfigSpec)
+    config = config_spec_class(name, expected_os_types=expected_os_types,
+                               flag_values=FLAGS, **config_dict)
+
+    # Assign a unique ID to each benchmark run. This differs even between two
+    # runs of the same benchmark within a single PKB run.
+    uid = name + str(benchmark_counts[name].next())
+
+    # Optional step to check flag values and verify files exist.
+    check_prereqs = getattr(benchmark_module, 'CheckPrerequisites', None)
+    if check_prereqs:
+      try:
+        with config.RedirectFlags(FLAGS):
+          check_prereqs()
+      except:
+        logging.exception('Prerequisite check failed for %s', name)
+        raise
+
+    result.append((
+        (benchmark_module, i + 1, total_benchmarks, config, uid),
+        [name, uid, benchmark_status.SKIPPED]))
+
+  return result
+
+
 def DoProvisionPhase(name, spec, timer):
   """Performs the Provision phase of benchmark execution.
 
@@ -208,12 +315,13 @@ def DoProvisionPhase(name, spec, timer):
       provisioning.
   """
   logging.info('Provisioning resources for benchmark %s', name)
+  spec.ConstructVirtualMachines()
   # Pickle the spec before we try to create anything so we can clean
   # everything up on a second run if something goes wrong.
   spec.PickleSpec()
   try:
     with timer.Measure('Resource Provisioning'):
-      spec.Prepare()
+      spec.Provision()
   finally:
     # Also pickle the spec after the resources are created so that
     # we have a record of things like AWS ids. Otherwise we won't
@@ -232,6 +340,8 @@ def DoPreparePhase(benchmark, name, spec, timer):
       benchmark module's Prepare function.
   """
   logging.info('Preparing benchmark %s', name)
+  with timer.Measure('BenchmarkSpec Prepare'):
+    spec.Prepare()
   with timer.Measure('Benchmark Prepare'):
     benchmark.Prepare(spec)
 
@@ -249,11 +359,13 @@ def DoRunPhase(benchmark, name, spec, collector, timer):
   """
   logging.info('Running benchmark %s', name)
   events.before_phase.send(events.RUN_PHASE, benchmark_spec=spec)
+  spec.StartBackgroundWorkload()
   try:
     with timer.Measure('Benchmark Run'):
       samples = benchmark.Run(spec)
   finally:
     events.after_phase.send(events.RUN_PHASE, benchmark_spec=spec)
+    spec.StopBackgroundWorkload()
   collector.AddSamples(samples, name, spec)
 
 
@@ -289,19 +401,52 @@ def DoTeardownPhase(name, spec, timer):
     spec.Delete()
 
 
-def RunBenchmark(benchmark, collector, sequence_number, total_benchmarks,
-                 benchmark_config, benchmark_uid):
+def _GetBenchmarkSpec(benchmark_config, benchmark_name, benchmark_uid):
+  """Creates a BenchmarkSpec or loads one from a file.
+
+  During the provision stage, creates a BenchmarkSpec from the provided
+  configuration. During any later stage, loads the BenchmarkSpec that was
+  created during the provision stage from a file.
+
+  Args:
+    benchmark_config: BenchmarkConfigSpec. The benchmark configuration to use
+        while running the current stage.
+    benchmark_name: string. Name of the benchmark.
+    benchmark_uid: string. Identifies a specific run of a benchmark.
+
+  Returns:
+    The created or loaded BenchmarkSpec.
+  """
+  if stages.PROVISION in FLAGS.run_stage:
+    return benchmark_spec.BenchmarkSpec(benchmark_config, benchmark_name,
+                                        benchmark_uid)
+  else:
+    try:
+      return benchmark_spec.BenchmarkSpec.GetSpecFromFile(benchmark_uid,
+                                                          benchmark_config)
+    except IOError:
+      if FLAGS.run_stage == [stages.PREPARE]:
+        logging.error(
+            'We were unable to load the BenchmarkSpec. This may be related '
+            'to two additional run stages which have recently been added. '
+            'Please make sure to run the stage "provision" before "prepare". '
+            'Similarly, make sure to run "teardown" after "cleanup".')
+      raise
+
+
+def RunBenchmark(benchmark, sequence_number, total_benchmarks, benchmark_config,
+                 benchmark_uid, collector):
   """Runs a single benchmark and adds the results to the collector.
 
   Args:
     benchmark: The benchmark module to be run.
-    collector: The SampleCollector object to add samples to.
     sequence_number: The sequence number of when the benchmark was started
-      relative to the other benchmarks in the suite.
+        relative to the other benchmarks in the suite.
     total_benchmarks: The total number of benchmarks in the suite.
-    benchmark_config: The config to run the benchmark with.
+    benchmark_config: BenchmarkConfigSpec. The config to run the benchmark with.
     benchmark_uid: An identifier unique to this run of the benchmark even
-      if the same benchmark is run multiple times with different configs.
+        if the same benchmark is run multiple times with different configs.
+    collector: The SampleCollector object to add samples to.
   """
   benchmark_name = benchmark.BENCHMARK_NAME
 
@@ -310,81 +455,54 @@ def RunBenchmark(benchmark, collector, sequence_number, total_benchmarks,
       benchmark_name, sequence_number, total_benchmarks)
   log_context = log_util.GetThreadLogContext()
   with log_context.ExtendLabel(label_extension):
-    # Optional prerequisite checking.
-    check_prereqs = getattr(benchmark, 'CheckPrerequisites', None)
-    if check_prereqs:
+    spec = _GetBenchmarkSpec(benchmark_config, benchmark_name, benchmark_uid)
+    with spec.RedirectGlobalFlags():
+      end_to_end_timer = timing_util.IntervalTimer()
+      detailed_timer = timing_util.IntervalTimer()
       try:
-        check_prereqs()
+        with end_to_end_timer.Measure('End to End'):
+          if stages.PROVISION in FLAGS.run_stage:
+            DoProvisionPhase(benchmark_name, spec, detailed_timer)
+
+          if stages.PREPARE in FLAGS.run_stage:
+            DoPreparePhase(benchmark, benchmark_name, spec, detailed_timer)
+
+          if stages.RUN in FLAGS.run_stage:
+            DoRunPhase(benchmark, benchmark_name, spec, collector,
+                       detailed_timer)
+
+          if stages.CLEANUP in FLAGS.run_stage:
+            DoCleanupPhase(benchmark, benchmark_name, spec, detailed_timer)
+
+          if stages.TEARDOWN in FLAGS.run_stage:
+            DoTeardownPhase(benchmark_name, spec, detailed_timer)
+
+        # Add samples for any timed interval that was measured.
+        include_end_to_end = timing_util.EndToEndRuntimeMeasurementEnabled()
+        include_runtimes = timing_util.RuntimeMeasurementsEnabled()
+        include_timestamps = timing_util.TimestampMeasurementsEnabled()
+        if FLAGS.run_stage == stages.STAGES:
+          # Ran all stages.
+          collector.AddSamples(
+              end_to_end_timer.GenerateSamples(
+                  include_runtime=include_end_to_end or include_runtimes,
+                  include_timestamps=include_timestamps),
+              benchmark_name, spec)
+        collector.AddSamples(detailed_timer.GenerateSamples(include_runtimes,
+                                                            include_timestamps),
+                             benchmark_name, spec)
+
       except:
-        logging.exception('Prerequisite check failed for %s', benchmark_name)
-        raise
-
-    end_to_end_timer = timing_util.IntervalTimer()
-    detailed_timer = timing_util.IntervalTimer()
-    spec = None
-    try:
-      with end_to_end_timer.Measure('End to End'):
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_PROVISION]:
-          # It is important to create the spec outside of DoProvisionPhase
-          # because if DoPreparePhase raises an exception, we still need
-          # a reference to the spec in order to delete it in the "finally"
-          # section below.
-          spec = benchmark_spec.BenchmarkSpec(benchmark_config, benchmark_name,
-                                              benchmark_uid)
-          spec.ConstructVirtualMachines()
-          DoProvisionPhase(benchmark_name, spec, detailed_timer)
-        else:
-          try:
-            spec = benchmark_spec.BenchmarkSpec.GetSpecFromFile(benchmark_uid)
-          except IOError:
-            if FLAGS.run_stage == STAGE_PREPARE:
-              logging.error(
-                  'We were unable to load the BenchmarkSpec. This may be '
-                  'related to two additional run stages which have recently '
-                  'been added. Please make sure to run the stage "provision" '
-                  'before "prepare". Similarly, make sure to run "teardown" '
-                  'after "cleanup".')
-            raise
-
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_PREPARE]:
-          DoPreparePhase(benchmark, benchmark_name, spec, detailed_timer)
-
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_RUN]:
-          DoRunPhase(benchmark, benchmark_name, spec, collector, detailed_timer)
-
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_CLEANUP]:
+        # Resource cleanup (below) can take a long time. Log the error to give
+        # immediate feedback, then re-throw.
+        logging.exception('Error during benchmark %s', benchmark_name)
+        # If the particular benchmark requests us to always call cleanup, do it
+        # here.
+        if stages.CLEANUP in FLAGS.run_stage and spec.always_call_cleanup:
           DoCleanupPhase(benchmark, benchmark_name, spec, detailed_timer)
-
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_TEARDOWN]:
-          DoTeardownPhase(benchmark_name, spec, detailed_timer)
-
-      # Add samples for any timed interval that was measured.
-      include_end_to_end = timing_util.EndToEndRuntimeMeasurementEnabled()
-      include_runtimes = timing_util.RuntimeMeasurementsEnabled()
-      include_timestamps = timing_util.TimestampMeasurementsEnabled()
-      if FLAGS.run_stage == STAGE_ALL:
-        collector.AddSamples(
-            end_to_end_timer.GenerateSamples(
-                include_runtime=include_end_to_end or include_runtimes,
-                include_timestamps=include_timestamps),
-            benchmark_name, spec)
-      collector.AddSamples(
-          detailed_timer.GenerateSamples(include_runtimes, include_timestamps),
-          benchmark_name, spec)
-
-    except:
-      # Resource cleanup (below) can take a long time. Log the error to give
-      # immediate feedback, then re-throw.
-      logging.exception('Error during benchmark %s', benchmark_name)
-      # If the particular benchmark requests us to always call cleanup, do it
-      # here.
-      if (FLAGS.run_stage in [STAGE_ALL, STAGE_CLEANUP] and spec and
-          spec.always_call_cleanup):
-        DoCleanupPhase(benchmark, benchmark_name, spec, detailed_timer)
-      raise
-    finally:
-      if spec:
-        if FLAGS.run_stage in [STAGE_ALL, STAGE_TEARDOWN]:
+        raise
+      finally:
+        if stages.TEARDOWN in FLAGS.run_stage:
           spec.Delete()
         # Pickle spec to save final resource state.
         spec.PickleSpec()
@@ -407,31 +525,13 @@ def SetUpPKB():
   SetUpPKB() also modifies the local file system by creating a temp
   directory and storing new SSH keys.
   """
+  try:
+    _InitializeRunUri()
+  except errors.Error as e:
+    logging.error(e)
+    sys.exit(1)
 
-  for executable in REQUIRED_EXECUTABLES:
-    if not vm_util.ExecutableOnPath(executable):
-      raise errors.Setup.MissingExecutableError(
-          'Could not find required executable "%s"', executable)
-
-  if FLAGS.run_uri is None:
-    if FLAGS.run_stage not in [STAGE_ALL, STAGE_PROVISION]:
-      # Attempt to get the last modified run directory.
-      run_uri = vm_util.GetLastRunUri()
-      if run_uri:
-        FLAGS.run_uri = run_uri
-        logging.warning(
-            'No run_uri specified. Attempting to run "%s" with --run_uri=%s.',
-            FLAGS.run_stage, FLAGS.run_uri)
-      else:
-        raise errors.Setup.NoRunURIError(
-            'No run_uri specified. Could not run "%s"', FLAGS.run_stage)
-    else:
-      FLAGS.run_uri = str(uuid.uuid4())[-8:]
-  elif not FLAGS.run_uri.isalnum() or len(FLAGS.run_uri) > MAX_RUN_URI_LENGTH:
-    raise errors.Setup.BadRunURIError('run_uri must be alphanumeric and less '
-                                      'than or equal to 8 characters in '
-                                      'length.')
-
+  # Initialize logging.
   vm_util.GenTempDir()
   log_util.ConfigureLogging(
       stderr_log_level=log_util.LOG_LEVELS[FLAGS.log_level],
@@ -440,64 +540,54 @@ def SetUpPKB():
       file_log_level=log_util.LOG_LEVELS[FLAGS.file_log_level])
   logging.info('PerfKitBenchmarker version: %s', version.VERSION)
 
-  vm_util.SSHKeyGen()
-
-  events.initialization_complete.send(parsed_flags=FLAGS)
-
-
-def RunBenchmarks(publish=True):
-  """Runs all benchmarks in PerfKitBenchmarker.
-
-  Args:
-    publish: A boolean indicating whether results should be published.
-
-  Returns:
-    Exit status for the process.
-  """
-  if FLAGS.version:
-    print version.VERSION
-    return
-
+  # Translate deprecated flags and log all provided flag values.
+  disk.WarnAndTranslateDiskFlags()
   _LogCommandLineFlags()
 
-  if FLAGS.os_type == benchmark_spec.WINDOWS and not vm_util.RunningOnWindows():
+  # Check environment.
+  if not FLAGS.ignore_package_requirements:
+    requirements.CheckBasicRequirements()
+
+  if FLAGS.os_type == os_types.WINDOWS and not vm_util.RunningOnWindows():
     logging.error('In order to run benchmarks on Windows VMs, you must be '
                   'running on Windows.')
-    return 1
+    sys.exit(1)
 
-  collector = SampleCollector()
+  for executable in REQUIRED_EXECUTABLES:
+    if not vm_util.ExecutableOnPath(executable):
+      raise errors.Setup.MissingExecutableError(
+          'Could not find required executable "%s"', executable)
+
+  vm_util.SSHKeyGen()
 
   if FLAGS.static_vm_file:
     with open(FLAGS.static_vm_file) as fp:
       static_virtual_machine.StaticVirtualMachine.ReadStaticVirtualMachineFile(
           fp)
 
-  run_status_lists = []
-  benchmark_tuple_list = benchmark_sets.GetBenchmarksFromFlags()
-  total_benchmarks = len(benchmark_tuple_list)
-  benchmark_counts = collections.defaultdict(itertools.count)
-  args = []
-  for i, benchmark_tuple in enumerate(benchmark_tuple_list):
-    benchmark_module, user_config = benchmark_tuple
-    benchmark_name = benchmark_module.BENCHMARK_NAME
-    benchmark_uid = benchmark_name + str(
-        benchmark_counts[benchmark_name].next())
-    run_status_lists.append([benchmark_name, benchmark_uid,
-                             benchmark_status.SKIPPED])
-    args.append((benchmark_module, collector, i + 1, total_benchmarks,
-                 benchmark_module.GetConfig(user_config), benchmark_uid))
+  events.initialization_complete.send(parsed_flags=FLAGS)
 
+
+def RunBenchmarks():
+  """Runs all benchmarks in PerfKitBenchmarker.
+
+  Returns:
+    Exit status for the process.
+  """
+  benchmark_run_list = _CreateBenchmarkRunList()
+  collector = SampleCollector()
   try:
-    for run_args, run_status_list in zip(args, run_status_lists):
-      benchmark_module, _, sequence_number, _, _, benchmark_uid = run_args
+    for run_args, run_status_list in benchmark_run_list:
+      benchmark_module, sequence_number, _, _, benchmark_uid = run_args
       benchmark_name = benchmark_module.BENCHMARK_NAME
       try:
         run_status_list[2] = benchmark_status.FAILED
-        RunBenchmark(*run_args)
+        RunBenchmark(*run_args, collector=collector)
         run_status_list[2] = benchmark_status.SUCCEEDED
       except BaseException as e:
         msg = 'Benchmark {0}/{1} {2} (UID: {3}) failed.'.format(
-            sequence_number, total_benchmarks, benchmark_name, benchmark_uid)
+            sequence_number, len(benchmark_run_list), benchmark_name,
+            benchmark_uid)
         if (isinstance(e, KeyboardInterrupt) or
             FLAGS.stop_after_benchmark_failure):
           logging.error('%s Execution will not continue.', msg)
@@ -508,12 +598,13 @@ def RunBenchmarks(publish=True):
     if collector.samples:
       collector.PublishSamples()
 
-    if run_status_lists:
+    if benchmark_run_list:
+      run_status_lists = tuple(r for _, r in benchmark_run_list)
       logging.info(benchmark_status.CreateSummary(run_status_lists))
     logging.info('Complete logs can be found at: %s',
                  vm_util.PrependTempDir(LOG_FILE_NAME))
 
-  if FLAGS.run_stage not in [STAGE_ALL, STAGE_TEARDOWN]:
+  if stages.TEARDOWN not in FLAGS.run_stage:
     logging.info(
         'To run again with this setup, please use --run_uri=%s', FLAGS.run_uri)
 
@@ -522,7 +613,7 @@ def RunBenchmarks(publish=True):
                        gsutil_path=FLAGS.gsutil_path,
                        prefix=FLAGS.run_uri + '_')
   all_benchmarks_succeeded = all(r[2] == benchmark_status.SUCCEEDED
-                                 for r in run_status_lists)
+                                 for _, r in benchmark_run_list)
   return 0 if all_benchmarks_succeeded else 1
 
 
@@ -558,37 +649,10 @@ def _GenerateBenchmarkDocumentation():
   return '\n\t'.join(benchmark_docs)
 
 
-def Main(argv=sys.argv):
-  logging.basicConfig(level=logging.INFO)
-
-  # TODO: Verify if there is other way of appending additional help
-  # message.
-  # Inject more help documentation
-  # The following appends descriptions of the benchmarks and descriptions of
-  # the benchmark sets to the help text.
-  benchmark_sets_list = [
-      '%s:  %s' %
-      (set_name, benchmark_sets.BENCHMARK_SETS[set_name]['message'])
-      for set_name in benchmark_sets.BENCHMARK_SETS]
-  sys.modules['__main__'].__doc__ = (
-      'PerfKitBenchmarker version: {version}\n\n{doc}\n'
-      'Benchmarks (default requirements):\n'
-      '\t{benchmark_doc}').format(
-          version=version.VERSION,
-          doc=__doc__,
-          benchmark_doc=_GenerateBenchmarkDocumentation())
-  sys.modules['__main__'].__doc__ += ('\n\nBenchmark Sets:\n\t%s'
-                                      % '\n\t'.join(benchmark_sets_list))
-
-  try:
-    argv = FLAGS(argv)  # parse flags
-  except flags.FlagsError as e:
-    logging.error(
-        '%s\nUsage: %s ARGS\n%s', e, sys.argv[0], FLAGS)
-    sys.exit(1)
-
-  disk.WarnAndTranslateDiskFlags()
-
+def Main():
+  log_util.ConfigureBasicLogging()
+  _InjectBenchmarkInfoIntoDocumentation()
+  _ParseFlags()
+  CheckVersionFlag()
   SetUpPKB()
-
   return RunBenchmarks()
