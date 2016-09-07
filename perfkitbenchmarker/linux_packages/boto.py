@@ -1,4 +1,4 @@
-# Copyright 2014 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2016 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Module containing OpenJDK7 installation and cleanup functions."""
-
-JAVA_HOME = '/usr'
+"""Package for installing the boto library."""
 
 
-def YumInstall(vm):
-  """Installs the OpenJDK7 package on the VM."""
-  vm.InstallPackages('java-1.7.0-openjdk-devel')
-
-
-def AptInstall(vm):
-  """Installs the OpenJDK7 package on the VM."""
-  vm.InstallPackages('openjdk-7-jdk')
+def Install(vm):
+  """Installs the boto package on the VM."""
+  vm.Install('pip')
+  vm.RemoteCommand('sudo pip install boto')

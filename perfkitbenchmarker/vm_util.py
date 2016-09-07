@@ -205,7 +205,7 @@ def Retry(poll_interval=POLL_INTERVAL, max_retries=MAX_RETRIES,
     timeout: The timeout for all tries in seconds. If -1, this means continue
         until max_retries is met. The function will stop retrying when either
         max_retries is met or timeout is reached.
-    fuzz: The ammount of randomness in the sleep time. This is used to
+    fuzz: The amount of randomness in the sleep time. This is used to
         keep threads from all retrying at the same time. At 0, this
         means sleep exactly poll_interval seconds. At 1, this means
         sleep anywhere from 0 to poll_interval seconds.
@@ -358,6 +358,10 @@ def IssueRetryableCommand(cmd, env=None):
 
 def ParseTimeCommandResult(command_result):
   """Parse command result and get time elapsed.
+
+  Note this parses the output of bash's time builtin, not /usr/bin/time or other
+  implementations. You may need to run something like bash -c "time ./command"
+  to produce parseable output.
 
   Args:
      command_result: The result after executing a remote time command.

@@ -24,6 +24,7 @@ import threading
 
 import jinja2
 
+from perfkitbenchmarker import background_workload
 from perfkitbenchmarker import data
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
@@ -38,6 +39,11 @@ DEFAULT_USERNAME = 'perfkit'
 
 _VM_SPEC_REGISTRY = {}
 _VM_REGISTRY = {}
+
+
+flags.DEFINE_list('vm_metadata', [], 'Metadata to add to the vm '
+                  'via the provider\'s AddMetadata function. It expects'
+                  'key:value pairs')
 
 
 def GetVmSpecClass(cloud):
@@ -578,16 +584,25 @@ class BaseOsMixin(object):
     raise NotImplementedError()
 
   def StartBackgroundWorkload(self):
-    """Start the background workload"""
-    if self.background_cpu_threads or self.background_network_mbits_per_sec:
-      raise NotImplementedError()
+    """Start the background workload."""
+    for workload in background_workload.BACKGROUND_WORKLOADS:
+      if workload.IsEnabled(self):
+        if self.OS_TYPE in workload.EXCLUDED_OS_TYPES:
+          raise NotImplementedError()
+        workload.Start(self)
 
   def StopBackgroundWorkload(self):
-    """Stop the background workoad"""
-    if self.background_cpu_threads or self.background_network_mbits_per_sec:
-      raise NotImplementedError()
+    """Stop the background workoad."""
+    for workload in background_workload.BACKGROUND_WORKLOADS:
+      if workload.IsEnabled(self):
+        if self.OS_TYPE in workload.EXCLUDED_OS_TYPES:
+          raise NotImplementedError()
+        workload.Stop(self)
 
   def PrepareBackgroundWorkload(self):
-    """Prepare for the background workload"""
-    if self.background_cpu_threads or self.background_network_mbits_per_sec:
-      raise NotImplementedError()
+    """Prepare for the background workload."""
+    for workload in background_workload.BACKGROUND_WORKLOADS:
+      if workload.IsEnabled(self):
+        if self.OS_TYPE in workload.EXCLUDED_OS_TYPES:
+          raise NotImplementedError()
+        workload.Prepare(self)

@@ -1,3 +1,124 @@
+# 1.7.0
+
+New features:
+* Add ProfitBricks provider (thanks @tjb1019, GH-1005)
+* Add YCSB JDBC benchmark (thanks @k1xme, GH-1049)
+* Add support for st1 and sc1 disks on EBS (GH-1067)
+
+Breaking changes:
+* Change default gce_migrate_on_maintenance to True (GH-1069)
+
+Enhancements:
+* Update OpenStack provider to use OpenStacks CLI instead of python library
+  (thanks @meteorfox, GH-942)
+* Improve side-by-side tool (GH-1034)
+* Specify flags to metadata (GH-1047)
+* Allow Java version for Java benchmarks to be selected via command line (GH-1051)
+* Add numjobs runtime option to fio_benchmark (GH-1066)
+* Add netperf histogram support (GH-1072)
+* Add multi-vm support for object_storage_service_benchmark (GH-1074)
+* Add support for custom s3 endpoints for object_storage_service_benchmark
+  (GH-1078)
+* Add user-defined metadata for vms (GH-1080)
+
+Bugfixes and maintenance updates:
+* Refactor object_storage_service_benchmark (GH-1023)
+* Support overriding ycsb_client_vms in benchmark spec (thanks @k1xme, GH-1042)
+* Update YCSB to 0.9.0 and support latest logging format (thanks @k1xme, GH-1043)
+* Fix zones flag (GH-1044)
+* Update Bigtable to v2 API (thanks @tswast, GH-1045)
+* Update maven version to 3.3.9 (GH-1046)
+* Start background workload in prepare stage and stop in cleanup stage (GH-1048)
+* Minor fixes in flag description (GH-1052)
+* Only upload files needed for API testing script for
+  object_storage_service_benchmark (GH-1053)
+* Fix redis_ycsb benchmark to use multiple processes (GH-1062, GH-1068, GH-1070)
+* Fix bug with custom machine types configs (GH-1077)
+* Fix in documentation of ParseTimeCommandResult (thanks @skorgu, GH-1079)
+* Replace Pandas dependency with Numpy (GH-1081)
+* Turn off OpenBlas threading, improving HPCC on large vms (GH-1084)
+* Cleanup object_storage_serivce benchmark (GH-1085)
+* Cleanup aerospike_ycsb benchmarks (GH-1086)
+
+# 1.6.0
+
+New features:
+* Apache Spark benchmark (GH-1014,GH-1011)
+* Cloudsuite dataserving benchmark (thanks @ustiugov, GH-930)
+
+Enhancements:
+* Optionally publish VM hostnames in metadata (GH-1020)
+* Control which netperf benchmarks are run via flag (GH-1029)
+* Netperf benchmark reports min and max latency (GH-1013)
+* Add multichase to the google benchmark set (GH-1018)
+* Update Cloudsuite web serving benchmark (thanks @ivonindza, @GH-998)
+* Object storage updates (GH-987)
+* Repeat Run stage (GH-1032)
+
+Bugfixes and maintenance updates:
+* Fix path to cassandra-cli (thanks @adamisrael, GH-1006)
+* Update ycsb version; affects cloud_bigtable_ycsb_benchmark, hbase_ycsb
+  (GH-1021, GH-1025, GH-1031)
+* Use latest gsutil version (GH-1012)
+* Remove duplicate requirements files (GH-975)
+* Update openblas version (GH-1003)
+* Background workload refactor (GH-1033)
+
+# 1.5.0
+
+New features:
+* Add cloudsuite graph analytics benchmark (thanks @mdrumond; GH-986)
+* Add initial implementation of multichase benchmark (GH-977)
+* Add cloudsuite media streaming benchmark (thanks @ivonindza; GH-993)
+* Add analysis functions for processing multistream object storage benchmark data (GH-905)
+* Add CloudSuite Data-caching benchmark (thanks @neo-apz; GH-970)
+* Add ability to bundle PKB into a python-executable zip file (GH-971)
+* Add os_type for Juju Mixin (thanks @AdamIsrael; GH-764)
+* Add CloudSuite in-memory analytics benchmark (thanks @ivonindza; GH-934)
+
+Breaking changes:
+* Replace the old CloudSuite Web Search benchmark with the docker version (thanks @javpicorel; GH-931)
+* Update Aerospike version (GH-978)
+
+Enhancements:
+* Add --fio_blocksize option (GH-943)
+* Update speccpu2006 benchmark to support iso file (GH-944)
+* Allow --run_stage to specify multiple stages (GH-935)
+* Add flag to control iperf timeout (GH-994)
+
+Bugfixes and maintenance updates:
+* Fix cloud bigtable and hbase (GH-1001)
+* Install openssl for the object storage benchmark (GH-1000)
+* Fix bug in MongoDB YCSB benchmark (GH-999)
+* Change import_util.LoadModulesForPath to also load packages (GH-983)
+* Add 'ap-northeast-2' to the S3 regions table (GH-990)
+* Change check-lint.sh to invoke flake8 via tox (GH-979)
+* Change GetLastRunUri to handle the new temp directory structure (GH-985)
+* Support S3 Signature Version 4 (GH-984)
+* Add back support for python-gflags version 2. (GH-973)
+* Define units.Unit.\_\_ne\_\_ (GH-976)
+* Reorder some PKB initialization steps (GH-965)
+* Move to gflags version 3.0.4 (GH-969)
+* Modify semantics of UnitsParser's convertible_to parameter (GH-968)
+* Add percent (%) as a recognized pint unit (GH-964)
+* Improve Azure CLI version check (GH-967, GH-958)
+* Don't request SSH verbose output when --log_level=debug (GH-962)
+* Move per-provider package requirement files (GH-961)
+* Move pint unit registry code into a separate module (GH-960)
+* Only check python package requirements if requirements.txt exists (GH-959)
+* Changed LoadProvider to accept un-lowered cloud provider name (GH-957)
+* Change bg tests to patch and verify call counts for each VM separately (GH-954)
+* Make BenchmarkSpec.vms order consistent across runs (GH-953)
+* Fix os type related issues and bugs (GH-950, GH-955, GH-952, GH-951, GH-949)
+* Call CheckPrerequisites earlier (GH-947)
+* Add percentiles option to PercentilesCalculator (GH-910)
+* Fix publisher bug when disk_size is None (GH-946)
+* Handle unset PYTHONPATH in tox.ini (GH-941)
+* Add a helper function to BenchmarkConfigSpec to redirect flags (GH-936)
+* Add support for interrupting child threads created by RunThreaded (GH-926)
+* Fix bugs and improve the Cloud Bigtable benchmark (GH-937, GH-933, GH-932)
+* Add a helpful error message if a UnitsParser parses a unitless value (GH-963)
+
 # 1.4.0
 
 New features:

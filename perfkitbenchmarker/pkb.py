@@ -16,7 +16,7 @@
 
 All benchmarks in PerfKitBenchmarker export the following interface:
 
-GetInfo: this returns, the name of the benchmark, the number of machines
+GetConfig: this returns, the name of the benchmark, the number of machines
          required to run one instance of the benchmark, a detailed description
          of the benchmark, and if the benchmark requires a scratch disk.
 Prepare: this function takes a list of VMs as an input parameter. The benchmark
@@ -60,6 +60,7 @@ import getpass
 import itertools
 import logging
 import sys
+import time
 import uuid
 
 from perfkitbenchmarker import archive
@@ -75,6 +76,7 @@ from perfkitbenchmarker import linux_benchmarks
 from perfkitbenchmarker import log_util
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import requirements
+from perfkitbenchmarker import spark_service
 from perfkitbenchmarker import stages
 from perfkitbenchmarker import static_virtual_machine
 from perfkitbenchmarker import timing_util
@@ -176,6 +178,19 @@ flags.DEFINE_bool(
 flags.DEFINE_boolean(
     'ignore_package_requirements', False,
     'Disables Python package requirement runtime checks.')
+flags.DEFINE_enum('spark_service_type', None,
+                  [spark_service.PKB_MANAGED, spark_service.PROVIDER_MANAGED],
+                  'Type of spark service to use')
+flags.DEFINE_boolean(
+    'publish_after_run', False,
+    'If true, PKB will publish all samples available immediately after running '
+    'each benchmark. This may be useful in scenarios where the PKB run time '
+    'for all benchmarks is much greater than a single benchmark.')
+flags.DEFINE_integer(
+    'run_stage_time', 0,
+    'PKB will run/re-run the run stage of each benchmark until it has spent '
+    'at least this many seconds. It defaults to 0, so benchmarks will only '
+    'be run once unless some other value is specified.')
 
 
 # Support for using a proxy in the cloud environment.
@@ -316,6 +331,7 @@ def DoProvisionPhase(name, spec, timer):
   """
   logging.info('Provisioning resources for benchmark %s', name)
   spec.ConstructVirtualMachines()
+  spec.ConstructSparkService()
   # Pickle the spec before we try to create anything so we can clean
   # everything up on a second run if something goes wrong.
   spec.PickleSpec()
@@ -344,6 +360,7 @@ def DoPreparePhase(benchmark, name, spec, timer):
     spec.Prepare()
   with timer.Measure('Benchmark Prepare'):
     benchmark.Prepare(spec)
+  spec.StartBackgroundWorkload()
 
 
 def DoRunPhase(benchmark, name, spec, collector, timer):
@@ -357,16 +374,25 @@ def DoRunPhase(benchmark, name, spec, collector, timer):
     timer: An IntervalTimer that measures the start and stop times of the
       benchmark module's Run function.
   """
-  logging.info('Running benchmark %s', name)
-  events.before_phase.send(events.RUN_PHASE, benchmark_spec=spec)
-  spec.StartBackgroundWorkload()
-  try:
-    with timer.Measure('Benchmark Run'):
-      samples = benchmark.Run(spec)
-  finally:
-    events.after_phase.send(events.RUN_PHASE, benchmark_spec=spec)
-    spec.StopBackgroundWorkload()
-  collector.AddSamples(samples, name, spec)
+  deadline = time.time() + FLAGS.run_stage_time
+  run_number = 0
+  while True:
+    logging.info('Running benchmark %s', name)
+    events.before_phase.send(events.RUN_PHASE, benchmark_spec=spec)
+    try:
+      with timer.Measure('Benchmark Run'):
+        samples = benchmark.Run(spec)
+    finally:
+      events.after_phase.send(events.RUN_PHASE, benchmark_spec=spec)
+    if FLAGS.run_stage_time:
+      for sample in samples:
+        sample.metadata['run_number'] = run_number
+    collector.AddSamples(samples, name, spec)
+    if FLAGS.publish_after_run:
+      collector.PublishSamples()
+    run_number += 1
+    if time.time() > deadline:
+      break
 
 
 def DoCleanupPhase(benchmark, name, spec, timer):
@@ -382,6 +408,7 @@ def DoCleanupPhase(benchmark, name, spec, timer):
   logging.info('Cleaning up benchmark %s', name)
 
   if spec.always_call_cleanup or any([vm.is_static for vm in spec.vms]):
+    spec.StopBackgroundWorkload()
     with timer.Measure('Benchmark Cleanup'):
       benchmark.Cleanup(spec)
 
@@ -624,7 +651,7 @@ def _GenerateBenchmarkDocumentation():
                            windows_benchmarks.BENCHMARKS):
     benchmark_config = configs.LoadMinimalConfig(
         benchmark_module.BENCHMARK_CONFIG, benchmark_module.BENCHMARK_NAME)
-    vm_groups = benchmark_config['vm_groups']
+    vm_groups = benchmark_config.get('vm_groups', {})
     total_vm_count = 0
     vm_str = ''
     scratch_disk_str = ''
@@ -636,7 +663,6 @@ def _GenerateBenchmarkDocumentation():
         total_vm_count += group_vm_count
       if group.get('disk_spec'):
         scratch_disk_str = ' with scratch volume(s)'
-
 
     name = benchmark_module.BENCHMARK_NAME
     if benchmark_module in windows_benchmarks.BENCHMARKS:

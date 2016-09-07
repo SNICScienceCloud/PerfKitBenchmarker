@@ -58,9 +58,6 @@ REMOTE_KEY_PATH = '.ssh/id_rsa'
 CONTAINER_MOUNT_DIR = '/mnt'
 CONTAINER_WORK_DIR = '/root'
 
-BACKGROUND_IPERF_PORT = 20001
-BACKGROUND_IPERF_SECONDS = 2147483647
-
 # This pair of scripts used for executing long-running commands, which will be
 # resilient in the face of SSH connection errors.
 # EXECUTE_COMMAND runs a command, streaming stdout / stderr to a file, then
@@ -565,47 +562,6 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
         time.sleep(end_time - time.time())
       self.RemoteCommand('pkill -9 sysbench')
 
-  def PrepareBackgroundWorkload(self):
-    """Install packages needed for the background workload """
-    if self.background_cpu_threads:
-      self.Install('sysbench')
-    if self.background_network_mbits_per_sec:
-      self.Install('iperf')
-
-  def StartBackgroundWorkload(self):
-    """Starts the blackground workload."""
-    if self.background_cpu_threads:
-      self.RemoteCommand(
-          'nohup sysbench --num-threads=%s --test=cpu --cpu-max-prime=10000000 '
-          'run 1> /dev/null 2> /dev/null &' % self.background_cpu_threads)
-    if self.background_network_mbits_per_sec:
-      self.AllowPort(BACKGROUND_IPERF_PORT)
-      self.RemoteCommand('nohup iperf --server --port %s &> /dev/null &' %
-                         BACKGROUND_IPERF_PORT)
-      stdout, _ = self.RemoteCommand('pgrep iperf -n')
-      self.server_pid = stdout.strip()
-
-      if self.background_network_ip_type == vm_util.IpAddressSubset.EXTERNAL:
-        ip_address = self.ip_address
-      else:
-        ip_address = self.internal_ip
-      iperf_cmd = ('nohup iperf --client %s --port %s --time %s -u -b %sM '
-                   '&> /dev/null &' % (ip_address, BACKGROUND_IPERF_PORT,
-                                       BACKGROUND_IPERF_SECONDS,
-                                       self.background_network_mbits_per_sec))
-
-      self.RemoteCommand(iperf_cmd)
-      stdout, _ = self.RemoteCommand('pgrep iperf -n')
-      self.client_pid = stdout.strip()
-
-  def StopBackgroundWorkload(self):
-    """Stops the background workload."""
-    if self.background_cpu_threads:
-      self.RemoteCommand('pkill -9 sysbench')
-    if self.background_network_mbits_per_sec:
-      self.RemoteCommand('kill -9 ' + self.client_pid)
-      self.RemoteCommand('kill -9 ' + self.server_pid)
-
 
 class RhelMixin(BaseLinuxMixin):
   """Class holding RHEL specific VM methods and attributes."""
@@ -669,7 +625,13 @@ class RhelMixin(BaseLinuxMixin):
       return
     if package_name not in self._installed_packages:
       package = linux_packages.PACKAGES[package_name]
-      package.YumInstall(self)
+      if hasattr(package, 'YumInstall'):
+        package.YumInstall(self)
+      elif hasattr(package, 'Install'):
+        package.Install(self)
+      else:
+        raise KeyError('Package %s has no install method for RHEL.' %
+                       package_name)
       self._installed_packages.add(package_name)
 
   def Uninstall(self, package_name):
@@ -677,6 +639,8 @@ class RhelMixin(BaseLinuxMixin):
     package = linux_packages.PACKAGES[package_name]
     if hasattr(package, 'YumUninstall'):
       package.YumUninstall(self)
+    elif hasattr(package, 'Uninstall'):
+      package.Uninstall(self)
 
   def GetPathToConfig(self, package_name):
     """Returns the path to the config file for PerfKit packages.
@@ -778,7 +742,13 @@ class DebianMixin(BaseLinuxMixin):
 
     if package_name not in self._installed_packages:
       package = linux_packages.PACKAGES[package_name]
-      package.AptInstall(self)
+      if hasattr(package, 'AptInstall'):
+        package.AptInstall(self)
+      elif hasattr(package, 'Install'):
+        package.Install(self)
+      else:
+        raise KeyError('Package %s has no install method for Debian.' %
+                       package_name)
       self._installed_packages.add(package_name)
 
   def Uninstall(self, package_name):
@@ -786,6 +756,8 @@ class DebianMixin(BaseLinuxMixin):
     package = linux_packages.PACKAGES[package_name]
     if hasattr(package, 'AptUninstall'):
       package.AptUninstall(self)
+    elif hasattr(package, 'Uninstall'):
+      package.Uninstall(self)
 
   def GetPathToConfig(self, package_name):
     """Returns the path to the config file for PerfKit packages.
@@ -823,6 +795,16 @@ class DebianMixin(BaseLinuxMixin):
 
     if commands:
       self.RemoteCommand(";".join(commands))
+
+  def IncreaseSSHConnection(self, target):
+    """Increase maximum number of ssh connections on vm.
+
+    Args:
+      target: int. The max number of ssh connection.
+    """
+    self.RemoteCommand(r'sudo sed -i -e "s/.*MaxStartups.*/MaxStartups {0}/" '
+                       '/etc/ssh/sshd_config'.format(target))
+    self.RemoteCommand('sudo service ssh restart')
 
 
 class ContainerizedDebianMixin(DebianMixin):
@@ -1161,7 +1143,13 @@ class JujuMixin(DebianMixin):
       logging.warn('Failed to install package %s, falling back to Apt (%s)'
                    % (package_name, e))
       if package_name not in self._installed_packages:
-        package.AptInstall(self)
+        if hasattr(package, 'AptInstall'):
+          package.AptInstall(self)
+        elif hasattr(package, 'Install'):
+          package.Install(self)
+        else:
+          raise KeyError('Package %s has no install method for Juju machines.' %
+                         package_name)
         self._installed_packages.add(package_name)
 
   def SetupPackageManager(self):

@@ -39,6 +39,7 @@ In its current release these are the benchmarks that are executed:
   - `bonnie++`: [GPL v2](http://www.coker.com.au/bonnie++/readme.html)
   - `cassandra_ycsb`: [Apache v2](http://cassandra.apache.org/)
   - `cassandra_stress`: [Apache v2](http://cassandra.apache.org/)
+  - `cloudsuite3.0`: [CloudSuite 3.0 license](http://cloudsuite.ch/licenses/)
   - `cluster_boot`: MIT License
   - `coremark`: [EEMBC](https://www.eembc.org/)
   - `copy_throughput`: Apache v2
@@ -110,6 +111,7 @@ Before you can run the PerfKit Benchmarker, you need account(s) on the cloud pro
 * [AliCloud](http://www.alicloud.com)
 * [DigitalOcean](https://www.digitalocean.com)
 * [Rackspace Cloud](https://www.rackspace.com)
+* [ProfitBricks](https://www.profitbricks.com/)
 
 You also need the software dependencies, which are mostly command line tools and credentials to access your
 accounts without a password.  The following steps should help you get the CLI tool auth in place.
@@ -163,6 +165,7 @@ This section describes the setup steps needed for each cloud system.
 * [AliCloud](#install-alicloud-cli-and-setup-authentication)
 * [DigitalOcean](#digitalocean-configuration-and-credentials)
 * [RackSpace](#installing-clis-and-credentials-for-rackspace)
+* [ProfitBricks](#profitbricks-configuration-and-credentials)
 
 After configuring the clouds you intend to use, skip to [Running a Single Benchmark](#running-a-single-benchmark), unless you are going to use an object storage benchmark, in which case you need to [configure a boto file](#create-and-configure-a-boto-file-for-object-storage-benchmarks).
 
@@ -195,41 +198,17 @@ $ gcloud auth login
 
 For help, see [`gcloud` docs](https://cloud.google.com/sdk/gcloud/).
 
-### Install OpenStack Nova client and setup authentication
+### Install OpenStack CLI client and setup authentication
 Make sure you have installed pip (see the section above).
 
-Install `python-novaclient` via the following command:
+Install OpenStack CLI utilities via the following command:
 
 ```bash
 $ sudo pip install -r perfkitbenchmarker/providers/openstack/requirements.txt
 ```
 
-You must specify authentication information for test execution, including user
-name (``--openstack_username` flag or `OS_USERNAME` environment variable), tenant name
-(`--openstack_tenant` flag or `OS_TENANT_NAME` environment variable), and
-authentication URL (`--openstack_auth_url` flag or `OS_AUTH_URL` environment
-variable).
-
-The password cannot be set through a flag. You can specify it through the
-`OS_PASSWORD` environment variable, or alternatively you can save it in a file
-and specify the file location with the `--openstack_password_file` flag or
-`OPENSTACK_PASSWORD_FILE` environment variable.
-
-Example using environment variables:
-
-```bash
-export OS_USERNAME=admin
-export OS_TENANT=myproject
-export OS_AUTH_URL=http://localhost:5000
-export OS_PASSWORD=<password>
-```
-
-Example using a password file at the default file location:
-
-```bash
-$ echo topsecretpassword > ~/.config/openstack-password.txt
-$ ./pkb.py --cloud=OpenStack --benchmarks=ping
-```
+To setup credentials and endpoint information simply set the environment
+variables using an OpenStack RC file. For help, see [`OpenStack` docs](http://docs.openstack.org/cli-reference/common/cli_set_environment_variables_using_openstack_rc.html)
 
 ### Kubernetes configuration and credentials
 Perfkit uses the `kubectl` binary in order to communicate with a Kubernetes cluster - you need to pass the path to the `kubectl` binary using the `--kubectl` flag. It's recommended to use [version 1.0.1](https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kubectl).
@@ -535,6 +514,35 @@ You can find more details here: https://developer.rackspace.com/docs/rack-cli/co
 if the flavor is supported in the region.
 
 
+### ProfitBricks configuration and credentials
+
+Get started by running:
+```bash
+$ sudo pip install -r perfkitbenchmarker/providers/profitbricks/requirements.txt
+```
+
+PerfKit Benchmarker uses the 
+<a href='http://docs.python-requests.org/en/master/'>Requests</a> module 
+to interact with ProfitBricks' REST API. HTTP Basic authentication is used 
+to authorize access to the API. Please set this up as follows:
+
+Create a configuration file containing the email address and password 
+associated with your ProfitBricks account, separated by a colon. 
+Example:
+
+```bash
+$ less ~/.config/profitbricks-auth.cfg
+email:password
+```
+
+The PerfKit Benchmarker will automatically base64 encode your credentials 
+before making any calls to the REST API.
+
+PerfKit Benchmarker uses the file location `~/.config/profitbricks-auth.cfg`
+by default. You can use the `--profitbricks_config` flag to
+override the path.
+
+
 ## Image prerequisites for Docker based clouds
 Docker instances by default don't allow to SSH into them. Thus it is important to configure your Docker image so that it has SSH server installed. You can use your own image or build a new one based on a Dockerfile placed in `tools/docker_images` directory - in this case please refer to [Docker images document](https://github.com/GoogleCloudPlatform/PerfKitBenchmarker/tree/master/tools/docker_images).
 
@@ -611,7 +619,8 @@ $ ./pkb.py --cloud=DigitalOcean --machine_type=16gb --benchmarks=iperf
 ## Example run on OpenStack
 
 ```bash
-$ ./pkb.py --cloud=OpenStack --benchmarks=iperf --os_auth_url=http://localhost:5000/v2.0/
+$ ./pkb.py --cloud=OpenStack --machine_type=m1.medium \
+           --openstack_network=private --benchmarks=iperf
 ```
 
 ## Example run on Kubernetes
@@ -636,6 +645,12 @@ $ ./pkb.py --cloud=Mesos --benchmarks=iperf --marathon_address=localhost:8080 --
 
 ```bash
 $ ./pkb.py --cloud=Rackspace --machine_type=general1-2 --benchmarks=iperf
+```
+
+## Example run on ProfitBricks
+
+```bash
+$ ./pkb.py --cloud=ProfitBricks --machine_type=Small --benchmarks=iperf
 ```
 
 How to Run Windows Benchmarks
@@ -717,6 +732,7 @@ OpenStack | nova | |
 CloudStack | QC-1 | |
 Rackspace | IAD | OnMetal machine-types are available only in IAD zone
 Kubernetes | k8s | |
+ProfitBricks | ZONE_1 | Additional zones: ZONE_2
 
 Example:
 

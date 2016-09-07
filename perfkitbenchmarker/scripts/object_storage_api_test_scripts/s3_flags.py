@@ -1,4 +1,4 @@
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2016 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,5 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This file is deprecated. Use the forwarded file location:
--rperfkitbenchmarker/providers/cloudstack/requirements.txt
+"""Flags for the S3 provider interface."""
+
+import gflags as flags
+
+flags.DEFINE_string('host', None, 'The hostname of the storage endpoint.')

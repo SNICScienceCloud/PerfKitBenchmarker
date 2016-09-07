@@ -36,10 +36,10 @@ import time
 
 import yaml
 
-import boto
 import gflags as flags
-import gcs_oauth2_boto_plugin  # noqa
-from azure.storage.blob import BlobService
+
+import azure_flags  # noqa
+import s3_flags  # noqa
 
 FLAGS = flags.FLAGS
 
@@ -47,19 +47,11 @@ flags.DEFINE_enum(
     'storage_provider', 'GCS', ['GCS', 'S3', 'AZURE'],
     'The target storage provider to test.')
 
-flags.DEFINE_string('host', None, 'The hostname of the storage endpoint.')
-
 flags.DEFINE_string('bucket', None,
                     'The name of the bucket to test with. Caller is '
                     'responsible to create an empty bucket for a particular '
                     'invocation of this test and then clean-up the bucket '
                     'after this test returns.')
-
-flags.DEFINE_string('azure_account', None,
-                    'The name of the storage account for Azure.')
-
-flags.DEFINE_string('azure_key', None,
-                    'The key of the storage account for Azure.')
 
 flags.DEFINE_enum(
     'scenario', 'OneByteRW', ['OneByteRW', 'ListConsistency',
@@ -89,6 +81,8 @@ flags.DEFINE_string('object_sizes', "{1024: 100.0}", 'The size of the objects '
 flags.DEFINE_integer('num_streams', 10, 'The number of streams to use. Only '
                      'applies to the MultiStreamThroughput scenario.',
                      lower_bound=1)
+flags.DEFINE_integer('stream_num_start', 1, 'The number of the first thread in '
+                     'this process.')
 flags.DEFINE_string('objects_written_file', None, 'The path where the '
                     'multistream write benchmark will save a list of the '
                     'objects it wrote, and the multistream read benchmark will '
@@ -104,6 +98,17 @@ flags.DEFINE_string('object_storage_class', None, 'The storage class to use '
                     'for uploads. Currently only applicable to AWS. For other '
                     'providers, storage class is determined by the bucket, '
                     'which is passed in by the --bucket parameter.')
+
+flags.DEFINE_enum('object_naming_scheme', 'sequential_by_stream',
+                  ['sequential_by_stream',
+                   'approximately_sequential'],
+                  'How objects will be named. Only applies to the '
+                  'MultiStreamWrite benchmark. '
+                  'sequential_by_stream: object names from each stream '
+                  'will be sequential, but different streams will have '
+                  'different name prefixes. '
+                  'approximately_sequential: object names from all '
+                  'streams will roughly increase together.')
 
 STORAGE_TO_SCHEMA_DICT = {'GCS': 'gs', 'S3': 's3', 'AZURE': 'azure'}
 
@@ -152,9 +157,6 @@ LARGE_OBJECT_COUNT = 100
 
 LARGE_OBJECT_FAILURE_TOLERANCE = 0.1
 
-# A global variable initialized once for Azure Blob Service
-_AZURE_BLOB_SERVICE = None
-
 BYTES_PER_KILOBYTE = 1024
 
 # The multistream benchmarks log how many threads are still active
@@ -169,21 +171,7 @@ class LowAvailabilityError(Exception):
     pass
 
 
-def _useBotoApi(storage_schema):
-  """Decides if the caller should use the boto api given a storage schema.
-
-  Args:
-    storage_schema: The schema represents the storage provider.
-
-  Returns:
-    A boolean indicates whether or not to use boto API.
-  """
-
-  if storage_schema == 'gs' or storage_schema == 's3':
-    return True
-  else:
-    return False
-
+# ### Utilities for workload generation ###
 
 class SizeDistributionIterator(object):
   """Draw object sizes from a distribution.
@@ -245,6 +233,8 @@ def MaxSizeInDistribution(dist):
   return max(dist.iterkeys())
 
 
+# ### Utilities for data analysis ###
+
 def PercentileCalculator(numbers):
   numbers_sorted = sorted(numbers)
   count = len(numbers_sorted)
@@ -270,82 +260,66 @@ def PercentileCalculator(numbers):
 
   return result
 
+# ### Object naming schemes ###
 
-def _ListObjects(storage_schema, bucket, prefix, host_to_connect=None):
-  """List objects under a bucket given a prefix.
 
-  Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
-    bucket: Name of the bucket.
-    prefix: A prefix to list from.
-    host_to_connect: An optional endpoint string to connect to.
+class ObjectNameIterator(object):
+  """Provides new object names on demand.
 
-  Returns:
-    A list of object names.
+  This class exists to easily support different object naming schemes.
   """
 
-  bucket_list_result = None
-  if _useBotoApi(storage_schema):
-    bucket_uri = boto.storage_uri(bucket, storage_schema)
-    if host_to_connect is not None:
-      bucket_uri.connect(host=host_to_connect)
+  def __iter__(self):
+    """The iterator for this iterator.
 
-    bucket_list_result = bucket_uri.list_bucket(prefix=prefix)
-  else:
-    bucket_list_result = _AZURE_BLOB_SERVICE.list_blobs(bucket, prefix=prefix)
+    This method is required by the Python iterator protocol.
+    """
+    return self
 
-  list_result = []
-  for k in bucket_list_result:
-    list_result.append(k.name)
+  def next(self):
+    """Generate a new name.
 
-  return list_result
+    Returns:
+      The object name, as a string.
+    """
 
-
-def DeleteObjects(storage_schema, bucket, objects_to_delete,
-                  host_to_connect=None,
-                  objects_deleted=None):
-  """Delete a bunch of objects.
-
-  Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
-    bucket: Name of the bucket.
-    objects_to_delete: A list of names of objects to delete.
-    host_to_connect: An optional endpoint string to connect to.
-    objects_deleted: An optional list to record the objects that have been
-        successfully deleted.
-  """
-
-  for object_name in objects_to_delete:
-    try:
-      if _useBotoApi(storage_schema):
-        object_path = '%s/%s' % (bucket, object_name)
-        object_uri = boto.storage_uri(object_path, storage_schema)
-        if host_to_connect is not None:
-          object_uri.connect(host=host_to_connect)
-
-        object_uri.delete_key()
-      else:
-        _AZURE_BLOB_SERVICE.delete_blob(bucket, object_name)
-
-      if objects_deleted is not None:
-        objects_deleted.append(object_name)
-    except:
-      logging.exception('Caught exception while deleting object %s.',
-                        object_name)
+    raise NotImplementedError()
 
 
-def CleanupBucket(storage_schema):
+class PrefixCounterIterator(ObjectNameIterator):
+  def __init__(self, prefix):
+    self.prefix = prefix
+    self.counter = 0
+
+  def next(self):
+    name = '%s_%d' % (self.prefix, self.counter)
+    self.counter = self.counter + 1
+    return name
+
+
+class PrefixTimestampSuffixIterator(ObjectNameIterator):
+  def __init__(self, prefix, suffix):
+    self.prefix = prefix
+    self.suffix = suffix
+
+  def next(self):
+    return '%s_%f_%s' % (self.prefix, time.time(), self.suffix)
+
+
+# ### Utilities for benchmarking ###
+
+def CleanupBucket(service):
   """ Cleans-up EVERYTHING under a given bucket as specified by FLAGS.bucket.
 
   Args:
-    Storage_schema: The address schema identifying a storage. e.g., "gs"
+    service: the ObjectStorageServiceBase to use.
   """
 
-  objects_to_cleanup = _ListObjects(storage_schema, FLAGS.bucket, prefix=None)
+  objects_to_cleanup = service.ListObjects(FLAGS.bucket, prefix=None)
   while len(objects_to_cleanup) > 0:
     logging.info('Will delete %d objects.', len(objects_to_cleanup))
-    DeleteObjects(storage_schema, FLAGS.bucket, objects_to_cleanup)
-    objects_to_cleanup = _ListObjects(storage_schema, FLAGS.bucket, prefix=None)
+    service.DeleteObjects(FLAGS.bucket, objects_to_cleanup)
+    objects_to_cleanup = service.ListObjects(FLAGS.bucket, prefix=None)
 
 
 def GenerateWritePayload(size):
@@ -368,13 +342,13 @@ def GenerateWritePayload(size):
   return payload_bytes.decode('ascii')
 
 
-def WriteObjects(storage_schema, bucket, object_prefix, count,
+def WriteObjects(service, bucket, object_prefix, count,
                  size, objects_written, latency_results=None,
-                 bandwidth_results=None, host_to_connect=None):
-  """Write a number of objects to a storage provider.
+                 bandwidth_results=None):
+  """Write a number of objects to a storage service.
 
   Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
+    service: the ObjectStorageServiceBase object to use.
     bucket: Name of the bucket to write to.
     object_prefix: The prefix of names of objects to be written.
     count: The total number of objects that need to be written.
@@ -388,7 +362,6 @@ def WriteObjects(storage_schema, bucket, object_prefix, count,
     bandwidth_results: An optional parameter that caller can supply to hold
         bandwidth numbers, in bytes per second, for each object that is
         successfully written.
-    host_to_connect: An optional endpoint string to connect to.
   """
 
   payload = GenerateWritePayload(size)
@@ -398,10 +371,8 @@ def WriteObjects(storage_schema, bucket, object_prefix, count,
     object_name = '%s_%d' % (object_prefix, i)
 
     try:
-      _, latency = WriteObjectFromBuffer(
-          storage_schema, bucket, object_name,
-          handle, size,
-          host_to_connect=host_to_connect)
+      _, latency = service.WriteObjectFromBuffer(
+          bucket, object_name, handle, size)
 
       objects_written.append(object_name)
       if latency_results is not None:
@@ -413,75 +384,24 @@ def WriteObjects(storage_schema, bucket, object_prefix, count,
                    (e, object_name))
 
 
-def WriteObjectFromBuffer(storage_schema, bucket_name, object_name,
-                          stream, size, host_to_connect=None):
-  """Write an object to a storage provider.
-
-  Exceptions are propagated to the caller, which can decide whether to
-  tolerate them or not. This function will seek() to the beginning of stream
-  before sending.
-
-  Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
-    bucket_name: Name of the bucket to write to.
-    object_name: Name of the object.
-    stream: A read()-able and seek()-able stream to transfer.
-    size: The number of bytes to transfer.
-    host_to_connect: An optional endpoint string to connect to.
-
-  Returns:
-    a tuple (start_time, latency).
-
-  """
-
-  # Ready to go!
-  stream.seek(0)
-  start_time = time.time()
-
-  if _useBotoApi(storage_schema):
-    object_path = '%s/%s' % (bucket_name, object_name)
-    object_uri = boto.storage_uri(object_path, storage_schema)
-    if host_to_connect is not None:
-      object_uri.connect(host=host_to_connect)
-
-    if FLAGS.object_storage_class and storage_schema == 's3':
-      # We need to use a lower-level upload method when using an S3
-      # storage class because we need access to the key object so we
-      # can set its storage class.
-      key = object_uri.new_key()
-      key._set_storage_class(FLAGS.object_storage_class)
-      key.set_contents_from_file(stream, size=size)
-    else:
-      object_uri.set_contents_from_file(stream, size=size)
-  else:
-    _AZURE_BLOB_SERVICE.put_block_blob_from_file(
-        bucket_name, object_name, stream, count=size)
-
-  latency = time.time() - start_time
-
-  return start_time, latency
-
-
-def ReadObjects(storage_schema, bucket, objects_to_read, latency_results=None,
+def ReadObjects(service, bucket, objects_to_read, latency_results=None,
                 bandwidth_results=None, object_size=None,
-                start_times=None, host_to_connect=None):
+                start_times=None):
   """Read a bunch of objects.
 
   Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
+    service: the ObjectStorageServiceBase object to use.
     bucket: Name of the bucket.
     objects_to_read: A list of names of objects to read.
     latency_results: An optional list to receive latency results.
     bandwidth_results: An optional list to receive bandwidth results.
     object_size: Size of the object that will be read, used to calculate bw.
     start_times: An optional list to receive start time results.
-    host_to_connect: An optional endpoint string to connect to.
   """
 
   for object_name in objects_to_read:
     try:
-      start_time, latency = ReadObject(storage_schema, bucket, object_name,
-                                       host_to_connect=host_to_connect)
+      start_time, latency = service.ReadObject(bucket, object_name)
 
       if start_times is not None:
         start_times.append(start_time)
@@ -496,55 +416,21 @@ def ReadObjects(storage_schema, bucket, objects_to_read, latency_results=None,
       logging.exception('Failed to read object %s', object_name)
 
 
-def ReadObject(storage_schema, bucket_name, object_name, host_to_connect=None):
-  """Read an object.
-
-  Exceptions are propagated to the caller, which can decide whether to
-  tolerate them or not.
-
-  Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
-    bucket_name: Name of the bucket.
-    object_name: Name of the object.
-    host_to_connect: An optional endpoint string to connect to.
-
-  Returns:
-    A tuple (start_time, latency)
-  """
-
-  start_time = time.time()
-
-  if _useBotoApi(storage_schema):
-    object_path = '%s/%s' % (bucket_name, object_name)
-    object_uri = boto.storage_uri(object_path, storage_schema)
-    if host_to_connect is not None:
-      object_uri.connect(host=host_to_connect)
-    object_uri.new_key().get_contents_as_string()
-  else:
-    _AZURE_BLOB_SERVICE.get_blob_to_bytes(bucket_name, object_name)
-
-  latency = time.time() - start_time
-
-  return start_time, latency
-
-
-def DeleteObjectsConcurrently(storage_schema, per_thread_objects_to_delete,
-                              host_to_connect, per_thread_objects_deleted):
+def DeleteObjectsConcurrently(service, per_thread_objects_to_delete,
+                              per_thread_objects_deleted):
   """Delete a bunch of objects concurrently.
 
   Args:
-    storage_schema: The address schema identifying a storage. e.g., "gs"
+    service: the ObjectStorageServiceBase object to use.
     per_thread_objects_to_delete: A 2-d list of objects to delete per thread.
-
-    host_to_connect: An optional endpoint string to connect to.
-    per_thread_objects_deleted: A list to record the objects that have been
+    per_thread_objects_deleted: A 2-d list to record the objects that have been
         successfully deleted per thread.
   """
   threads = []
   for i in range(LIST_CONSISTENCY_THREAD_COUNT):
-    thread = Thread(target=DeleteObjects,
-                    args=(storage_schema, FLAGS.bucket,
-                          per_thread_objects_to_delete[i], host_to_connect,
+    thread = Thread(target=service.DeleteObjects,
+                    args=(FLAGS.bucket,
+                          per_thread_objects_to_delete[i],
                           per_thread_objects_deleted[i]))
     thread.daemon = True
     thread.start()
@@ -560,17 +446,16 @@ def DeleteObjectsConcurrently(storage_schema, per_thread_objects_to_delete,
   logging.info('Finished deleting')
 
 
-def ListAndWaitForObjects(counting_start_time, expected_set_of_objects,
-                          storage_schema, object_prefix, host_to_connect):
+def ListAndWaitForObjects(service, counting_start_time,
+                          expected_set_of_objects, object_prefix):
   """List objects and wait for consistency.
 
   Args:
+    service: the ObjectStorageServiceBase object to use.
     counting_start_time: The start time used to count for the inconsistency
         window.
     expected_set_of_objects: The set of expectation.
-    storage_schema: The address schema identifying a storage. e.g., "gs"
     object_prefix: The prefix of objects to list from.
-    host_to_connect: An optional endpoint string to connect to.
 
   Returns:
     result_consistent: Is the list consistent
@@ -585,8 +470,7 @@ def ListAndWaitForObjects(counting_start_time, expected_set_of_objects,
   list_latency = 0
   while total_wait_time < LIST_CONSISTENCY_WAIT_TIME_LIMIT:
     list_start_time = time.time()
-    list_result = _ListObjects(storage_schema, FLAGS.bucket, object_prefix,
-                               host_to_connect)
+    list_result = service.ListObjects(FLAGS.bucket, object_prefix)
     list_count += 1
     list_latency = time.time() - list_start_time
 
@@ -638,15 +522,14 @@ def AnalyzeListResults(final_result, result_consistent, list_count,
         LIST_CONSISTENCY_WAIT_TIME_LIMIT)
 
 
-def SingleStreamThroughputBenchmark(storage_schema, host_to_connect=None):
+def SingleStreamThroughputBenchmark(service):
   """ A benchmark test for single stream upload and download throughput.
 
   Args:
-    storage_schema: The schema of the storage provider to use, e.g., "gs"
-    host_to_connect: An optional host endpoint to connect to.
+    service: the ObjectStorageServiceBase object to use.
 
   Raises:
-    LowAvailabilityError: when the storage provider has failed a high number of
+    LowAvailabilityError: when the storage service has failed a high number of
         our RW requests that exceeds a threshold (>5%), we raise this error
         instead of collecting performance numbers from this run.
   """
@@ -654,10 +537,9 @@ def SingleStreamThroughputBenchmark(storage_schema, host_to_connect=None):
   write_bandwidth = []
   objects_written = []
 
-  WriteObjects(storage_schema, FLAGS.bucket, object_prefix,
+  WriteObjects(service, FLAGS.bucket, object_prefix,
                LARGE_OBJECT_COUNT, LARGE_OBJECT_SIZE_BYTES, objects_written,
-               bandwidth_results=write_bandwidth,
-               host_to_connect=host_to_connect)
+               bandwidth_results=write_bandwidth)
 
   try:
     if len(objects_written) < LARGE_OBJECT_COUNT * (
@@ -673,10 +555,9 @@ def SingleStreamThroughputBenchmark(storage_schema, host_to_connect=None):
                             sort_keys=True))
 
     read_bandwidth = []
-    ReadObjects(storage_schema, FLAGS.bucket, objects_written,
+    ReadObjects(service, FLAGS.bucket, objects_written,
                 bandwidth_results=read_bandwidth,
-                object_size=LARGE_OBJECT_SIZE_BYTES,
-                host_to_connect=host_to_connect)
+                object_size=LARGE_OBJECT_SIZE_BYTES)
     if len(read_bandwidth) < len(objects_written) * (
         1 - LARGE_OBJECT_FAILURE_TOLERANCE):  # noqa
       raise LowAvailabilityError('Failed to read required number of objects, '
@@ -690,8 +571,7 @@ def SingleStreamThroughputBenchmark(storage_schema, host_to_connect=None):
                             sort_keys=True))
 
   finally:
-    DeleteObjects(storage_schema, FLAGS.bucket, objects_written,
-                  host_to_connect=host_to_connect)
+    service.DeleteObjects(FLAGS.bucket, objects_written)
 
 
 def RunThreadedWorkers(worker, worker_args, per_thread_args=None):
@@ -749,15 +629,13 @@ def RunThreadedWorkers(worker, worker_args, per_thread_args=None):
   return results
 
 
-def MultiStreamWrites(storage_schema, host_to_connect=None):
+def MultiStreamWrites(service):
   """Run multi-stream write benchmark.
 
   Args:
-    storage_schema: a two-character string indicating the storage
-      type. Ex: 'gs', 's3'.
-    host_to_connect: if given, an endpoint URL to connect to.
+    service: the ObjectStorageServiceBase object to use.
 
-  This function writes objects to the storage backend, potentially
+  This function writes objects to the storage service, potentially
   using multiple threads.
 
   It doesn't return anything, but it outputs two sets of results in
@@ -789,12 +667,12 @@ def MultiStreamWrites(storage_schema, host_to_connect=None):
 
   results = RunThreadedWorkers(
       WriteWorker,
-      (storage_schema,
-       host_to_connect,
+      (service,
        payload,
        size_distribution,
        FLAGS.objects_per_stream,
-       FLAGS.start_time))
+       FLAGS.start_time,
+       FLAGS.object_naming_scheme))
 
   # object_records is the data we leave on the VM for future reads. We
   # need to pass data to the reader so it will know what object names
@@ -813,7 +691,7 @@ def MultiStreamWrites(storage_schema, host_to_connect=None):
       # If we can't write our objects written, we still want to return
       # the data we collected, so keep going.
       logging.info('Got exception %s while trying to write objects written '
-                   'file.', ex.msg)
+                   'file.', ex)
 
   # operation_records is the data we send back to the controller.
   operation_records = []
@@ -839,18 +717,16 @@ def MultiStreamWrites(storage_schema, host_to_connect=None):
   json.dump(operation_records, sys.stdout, indent=0)
 
 
-def MultiStreamReads(storage_schema, host_to_connect=None):
+def MultiStreamReads(service):
   """Run multi-stream read benchmark.
 
   Args:
-    storage_schema: a two-character string indicating the storage
-      type. Ex: 'gs', 's3'.
-    host_to_connect: if given, an endpoint URL to connect to.
+    service: the ObjectStorageServiceBase object to use.
 
   This function reads a list of object names and sizes from
   FLAGS.objects_written_file (in the format written by
   MultiStreamWrites and then reads the objects from the storage
-  backend, potentially using multiple threads.
+  service, potentially using multiple threads.
 
   It doesn't directly return anything, but it writes its results to
   sys.stdout in the following format:
@@ -877,8 +753,7 @@ def MultiStreamReads(storage_schema, host_to_connect=None):
 
   results = RunThreadedWorkers(
       ReadWorker,
-      (storage_schema,
-       host_to_connect,
+      (service,
        FLAGS.start_time),
       per_thread_args=objects_by_worker)
 
@@ -923,19 +798,18 @@ def SleepUntilTime(when):
     logging.info('Sleep time %s was too small', sleep_time)
 
 
-def WriteWorker(storage_schema, host_to_connect,
-                payload, size_distribution, num_objects,
-                start_time, result_queue, worker_num):
+def WriteWorker(service, payload,
+                size_distribution, num_objects,
+                start_time, naming_scheme, result_queue, worker_num):
   """Upload objects for the multi-stream writes benchmark.
 
   Args:
-    storage_schema: a two-character string indicating the storage
-      type. Ex: 'gs', 's3'.
-    host_to_connect: if given, an endpoint URL to connect to.
+    service: the ObjectStorageServiceBase object to use.
     payload: a string. The bytes to upload.
     size_distribution: the distribution of object sizes to use.
     num_objects: the number of objects to upload.
     start_time: a POSIX timestamp. When to start uploading.
+    naming_scheme: how to name objects. See flag.
     result_queue: a Queue.Queue to record results in.
     worker_num: the thread number of this worker.
   """
@@ -945,8 +819,14 @@ def WriteWorker(storage_schema, host_to_connect,
   latencies = []
   sizes = []
 
+  if naming_scheme == 'sequential_by_stream':
+    name_iterator = PrefixCounterIterator(
+        'pkb_write_worker_%f_%s' % (time.time(), worker_num))
+  elif naming_scheme == 'approximately_sequential':
+    name_iterator = PrefixTimestampSuffixIterator(
+        'pkb_writes_%s' % start_time,
+        '%s' % worker_num)
   size_iterator = SizeDistributionIterator(size_distribution)
-  object_prefix = ('pkb_write_worker_%f_%s' % (time.time(), worker_num))
 
   payload_handle = cStringIO.StringIO(payload)
 
@@ -954,14 +834,13 @@ def WriteWorker(storage_schema, host_to_connect,
     SleepUntilTime(start_time)
 
   for i in xrange(num_objects):
-    object_name = '%s_%d' % (object_prefix, i)
+    object_name = name_iterator.next()
     object_size = size_iterator.next()
 
     try:
-      start_time, latency = WriteObjectFromBuffer(
-          storage_schema, FLAGS.bucket, object_name,
-          payload_handle, object_size,
-          host_to_connect=host_to_connect)
+      start_time, latency = service.WriteObjectFromBuffer(
+          FLAGS.bucket, object_name,
+          payload_handle, object_size)
 
       object_names.append(object_name)
       start_times.append(start_time)
@@ -976,11 +855,10 @@ def WriteWorker(storage_schema, host_to_connect,
                     'start_times': start_times,
                     'latencies': latencies,
                     'sizes': sizes,
-                    'stream_num': worker_num})
+                    'stream_num': worker_num + FLAGS.stream_num_start})
 
 
-def ReadWorker(storage_schema, host_to_connect,
-               start_time, object_records,
+def ReadWorker(service, start_time, object_records,
                result_queue, worker_num):
 
   start_times = []
@@ -992,8 +870,7 @@ def ReadWorker(storage_schema, host_to_connect,
 
   for name, size in object_records:
     try:
-      start_time, latency = ReadObject(storage_schema, FLAGS.bucket,
-                                       name, host_to_connect=host_to_connect)
+      start_time, latency = service.ReadObject(FLAGS.bucket, name)
 
       start_times.append(start_time)
       latencies.append(latency)
@@ -1007,21 +884,20 @@ def ReadWorker(storage_schema, host_to_connect,
                     'start_times': start_times,
                     'latencies': latencies,
                     'sizes': sizes,
-                    'stream_num': worker_num})
+                    'stream_num': worker_num + FLAGS.stream_num_start})
 
 
-def OneByteRWBenchmark(storage_schema, host_to_connect=None):
+def OneByteRWBenchmark(service):
   """ A benchmark test for one byte object read and write. It uploads and
   downloads ONE_BYTE_OBJECT_COUNT number of 1-byte objects to the storage
-  provider, keeps track of the latency of these operations, and print out the
+  service, keeps track of the latency of these operations, and print out the
   result in JSON format at the end of the test.
 
   Args:
-    storage_schema: The schema of the storage provider to use, e.g., "gs"
-    host_to_connect: An optional host endpoint to connect to.
+    service: the ObjectStorageServiceBase object to use.
 
   Raises:
-    LowAvailabilityError: when the storage provider has failed a high number of
+    LowAvailabilityError: when the storage service has failed a high number of
         our RW requests that exceeds a threshold (>5%), we raise this error
         instead of collecting performance numbers from this run.
   """
@@ -1032,10 +908,9 @@ def OneByteRWBenchmark(storage_schema, host_to_connect=None):
   one_byte_write_latency = []
   one_byte_objects_written = []
 
-  WriteObjects(storage_schema, FLAGS.bucket, object_prefix,
+  WriteObjects(service, FLAGS.bucket, object_prefix,
                ONE_BYTE_OBJECT_COUNT, 1, one_byte_objects_written,
-               latency_results=one_byte_write_latency,
-               host_to_connect=host_to_connect)
+               latency_results=one_byte_write_latency)
 
   try:
     success_count = len(one_byte_objects_written)
@@ -1052,8 +927,8 @@ def OneByteRWBenchmark(storage_schema, host_to_connect=None):
 
     # Now download these objects and measure the latencies.
     one_byte_read_latency = []
-    ReadObjects(storage_schema, FLAGS.bucket, one_byte_objects_written,
-                one_byte_read_latency, host_to_connect)
+    ReadObjects(service, FLAGS.bucket, one_byte_objects_written,
+                one_byte_read_latency)
 
     success_count = len(one_byte_read_latency)
     if success_count < ONE_BYTE_OBJECT_COUNT * (1 - FAILURE_TOLERANCE):
@@ -1067,11 +942,10 @@ def OneByteRWBenchmark(storage_schema, host_to_connect=None):
                  json.dumps(PercentileCalculator(one_byte_read_latency),
                             sort_keys=True))
   finally:
-    DeleteObjects(storage_schema, FLAGS.bucket, one_byte_objects_written,
-                  host_to_connect=host_to_connect)
+    service.DeleteObjects(FLAGS.bucket, one_byte_objects_written)
 
 
-def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
+def ListConsistencyBenchmark(service):
   """ A benchmark test to measure list-after-write consistency. It uploads
   a large number of 1-byte objects in a short amount of time, and then issues
   a list request. If the first list request returns all objects as expected,
@@ -1081,8 +955,7 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
   consistent result.
 
   Args:
-    storage_schema: The schema of the storage provider to use, e.g., "gs"
-    host_to_connect: An optional host endpoint to connect to.
+    service: the ObjectStorageServiceBase object to use.
 
   Returns:
     A dictionary that contains the test results:
@@ -1092,7 +965,7 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
           reach consistency.
 
   Raises:
-    LowAvailabilityError: when the storage provider has failed a high number of
+    LowAvailabilityError: when the storage service has failed a high number of
         our RW requests that exceeds a threshold (>5%), we raise this error
         instead of collecting performance numbers from this run.
   """
@@ -1109,12 +982,11 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
   for i in range(LIST_CONSISTENCY_THREAD_COUNT):
     my_prefix = '%s_%d' % (object_prefix, i)
     thread = Thread(target=WriteObjects,
-                    args=(storage_schema, FLAGS.bucket, my_prefix,
+                    args=(service, FLAGS.bucket, my_prefix,
                           LIST_CONSISTENCY_OBJECT_COUNT /
                           LIST_CONSISTENCY_THREAD_COUNT,
                           1,
-                          per_thread_objects_written[i], None, None,
-                          host_to_connect))
+                          per_thread_objects_written[i], None, None))
     thread.daemon = True
     thread.start()
     threads.append(thread)
@@ -1143,8 +1015,8 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
   # objects_written. If they are not the same, keep doing it until they
   # are the same.
   result_consistent, list_count, list_latency, total_wait_time = (
-      ListAndWaitForObjects(write_finish_time, set(final_objects_written),
-                            storage_schema, object_prefix, host_to_connect))
+      ListAndWaitForObjects(service, write_finish_time,
+                            set(final_objects_written), object_prefix))
 
   final_result = {}
   AnalyzeListResults(final_result, result_consistent, list_count, list_latency,
@@ -1177,9 +1049,8 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
   per_thread_objects_deleted = [
       [] for i in range(LIST_CONSISTENCY_THREAD_COUNT)]
 
-  DeleteObjectsConcurrently(storage_schema,
+  DeleteObjectsConcurrently(service,
                             per_thread_objects_to_delete,
-                            host_to_connect,
                             per_thread_objects_deleted)
 
   delete_finish_time = time.time()
@@ -1190,8 +1061,8 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
     final_expectation += per_thread_objects_written[i]
 
   result_consistent, list_count, list_latency, total_wait_time = (
-      ListAndWaitForObjects(delete_finish_time, set(final_expectation),
-                            storage_schema, object_prefix, host_to_connect))
+      ListAndWaitForObjects(service, delete_finish_time,
+                            set(final_expectation), object_prefix))
 
   AnalyzeListResults(final_result, result_consistent, list_count, list_latency,
                      total_wait_time, LIST_AFTER_UPDATE_SCENARIO)
@@ -1200,15 +1071,13 @@ def ListConsistencyBenchmark(storage_schema, host_to_connect=None):
                final_result)
 
   # Final clean up: delete the objects still remaining.
-  DeleteObjectsConcurrently(storage_schema,
+  DeleteObjectsConcurrently(service,
                             per_thread_objects_written,
-                            host_to_connect,
                             per_thread_objects_deleted)
   return final_result
 
 
 def Main(argv=sys.argv):
-
   logging.basicConfig(level=logging.INFO)
 
   try:
@@ -1226,17 +1095,22 @@ def Main(argv=sys.argv):
                FLAGS.bucket,
                FLAGS.scenario)
 
-  host_to_connect = None
-  if FLAGS.host is not None:
-    logging.info('Will use user-specified host endpoint: %s', FLAGS.host)
-    host_to_connect = FLAGS.host
+  # This is essentially a dictionary lookup implemented in if
+  # statements, but doing it this way allows us to not import the
+  # modules of storage providers we're not using.
+  if FLAGS.storage_provider == 'AZURE':
+    import azure_service
+    service = azure_service.AzureService()
+  elif FLAGS.storage_provider == 'GCS':
+    import gcs
+    service = gcs.GCSService()
+  elif FLAGS.storage_provider == 'S3':
+    import s3
+    service = s3.S3Service()
+  else:
+    raise ValueError('Invalid storage provider %s' % FLAGS.storage_provider)
 
   if FLAGS.storage_provider == 'AZURE':
-    if FLAGS.azure_key is None or FLAGS.azure_account is None:
-      raise ValueError('Must specify azure account and key')
-    else:
-      global _AZURE_BLOB_SERVICE
-      _AZURE_BLOB_SERVICE = BlobService(FLAGS.azure_account, FLAGS.azure_key)
       # There are DNS lookup issues with the provider Azure when doing
       # "high" number of concurrent requests using multiple threads. The error
       # came from getaddrinfo() called by the azure python library. By reducing
@@ -1248,10 +1122,8 @@ def Main(argv=sys.argv):
       global LIST_CONSISTENCY_OBJECT_COUNT
       LIST_CONSISTENCY_OBJECT_COUNT = 1000
 
-  storage_schema = STORAGE_TO_SCHEMA_DICT[FLAGS.storage_provider]
-
   if FLAGS.scenario == 'OneByteRW':
-    return OneByteRWBenchmark(storage_schema, host_to_connect)
+    return OneByteRWBenchmark(service)
   elif FLAGS.scenario == 'ListConsistency':
     list_latency = {}
     list_inconsistency_window = {}
@@ -1264,7 +1136,7 @@ def Main(argv=sys.argv):
     logging.info('Running list consistency tests for %d iterations...',
                  FLAGS.iterations)
     for _ in range(FLAGS.iterations):
-      result = ListConsistencyBenchmark(storage_schema, host_to_connect)
+      result = ListConsistencyBenchmark(service)
       # Analyze the result for both scenarios.
       for scenario in [LIST_AFTER_WRITE_SCENARIO, LIST_AFTER_UPDATE_SCENARIO]:
         result_consistent = '%s%s' % (scenario, LIST_RESULT_SUFFIX_CONSISTENT)
@@ -1298,13 +1170,13 @@ def Main(argv=sys.argv):
 
     return 0
   elif FLAGS.scenario == 'SingleStreamThroughput':
-    return SingleStreamThroughputBenchmark(storage_schema, host_to_connect)
+    return SingleStreamThroughputBenchmark(service)
   elif FLAGS.scenario == 'CleanupBucket':
-    return CleanupBucket(storage_schema)
+    return CleanupBucket(service)
   elif FLAGS.scenario == 'MultiStreamWrite':
-    return MultiStreamWrites(storage_schema, host_to_connect)
+    return MultiStreamWrites(service)
   elif FLAGS.scenario == 'MultiStreamRead':
-    return MultiStreamReads(storage_schema, host_to_connect)
+    return MultiStreamReads(service)
 
 if __name__ == '__main__':
   sys.exit(Main())

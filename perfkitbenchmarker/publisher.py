@@ -47,6 +47,12 @@ flags.DEFINE_boolean(
     'default is False. Official test results are treated and queried '
     'differently from non-official test results.')
 
+flags.DEFINE_boolean(
+    'hostname_metadata',
+    False,
+    'A boolean indicating whether to publish VM hostnames as part of sample '
+    'metadata.')
+
 flags.DEFINE_string(
     'json_path',
     None,
@@ -88,8 +94,7 @@ flags.DEFINE_multistring(
     [],
     'A colon separated key-value pair that will be added to the labels field '
     'of all samples as metadata. Multiple key-value pairs may be specified '
-    'by separating each pair by commas. This option can be repeated multiple '
-    'times.')
+    'by separating each pair by commas.')
 
 DEFAULT_JSON_OUTPUT_NAME = 'perfkitbenchmarker_results.json'
 DEFAULT_CREDENTIALS_JSON = 'credentials.json'
@@ -138,6 +143,9 @@ class DefaultMetadataProvider(MetadataProvider):
   def AddMetadata(self, metadata, benchmark_spec):
     metadata = metadata.copy()
     metadata['perfkitbenchmarker_version'] = version.VERSION
+    if FLAGS.hostname_metadata:
+      metadata['hostnames'] = ','.join([vm.hostname
+                                        for vm in benchmark_spec.vms])
     for name, vms in benchmark_spec.vm_groups.iteritems():
       if len(vms) == 0:
         continue
@@ -612,3 +620,4 @@ class SampleCollector(object):
     """Publish samples via all registered publishers."""
     for publisher in self.publishers:
       publisher.PublishSamples(self.samples)
+    self.samples = []

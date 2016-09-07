@@ -24,7 +24,12 @@ class NoMatchError(ValueError):
   pass
 
 
-def ExtractGroup(regex, text, group=1):
+class TooManyMatchesError(ValueError):
+  """Raised when a regex matches a string more times than expected."""
+  pass
+
+
+def ExtractGroup(regex, text, group=1, flags=0):
   """Extracts a float from a regular expression matched to 'text'.
 
   Args:
@@ -32,13 +37,14 @@ def ExtractGroup(regex, text, group=1):
     text: string. Text to search.
     group: int. Group containing a floating point value. Use '0' for the whole
       string.
+    flags: int. Flags to pass to re.search().
   Returns:
     A floating point number matched by 'regex' on 'text'.
   Raises:
     NoMatchError: when 'regex' does not match 'text'.
     IndexError: when 'group' is not present in the match.
   """
-  match = re.search(regex, text)
+  match = re.search(regex, text, flags=flags)
   if not match:
     raise NoMatchError('No match for pattern "{0}" in "{1}"'.format(
         regex, text))
@@ -92,6 +98,29 @@ def ExtractAllMatches(regex, text):
     raise NoMatchError('No match for pattern "{0}" in "{1}"'.format(
         regex, text))
   return match
+
+
+def ExtractExactlyOneMatch(regex, text):
+  """Extracts exactly one match of a regular expression from 'text'.
+
+  Args:
+    regex: string. Regular expression, possibly with capturing group.
+    text: string. The text to search.
+
+  Returns:
+    The contents of the capturing group in the regex. If no capturing
+    group is present, the text that matched the expression.
+
+  Raises:
+    NoMatchError if 'regex' does not match 'text'.
+    TooManyMatchesError if 'regex' matches 'text' more than once.
+  """
+
+  matches = ExtractAllMatches(regex, text)
+  if len(matches) > 1:
+    raise TooManyMatchesError(
+        'Pattern "{0}" matched "{1}" non-uniquely.'.format(regex, text))
+  return matches[0]
 
 
 def Substitute(pattern, repl, text):

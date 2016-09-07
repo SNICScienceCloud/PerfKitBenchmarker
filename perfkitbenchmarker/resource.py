@@ -27,13 +27,19 @@ from perfkitbenchmarker import vm_util
 
 
 class BaseResource(object):
-  """An object representing a cloud resource."""
+  """An object representing a cloud resource.
+
+  Attributes:
+    created: True if the resource has been created.
+    pkb_managed: Whether the resource is managed (created and deleted) by PKB.
+  """
 
   __metaclass__ = abc.ABCMeta
 
-  def __init__(self):
+  def __init__(self, user_managed=False):
     super(BaseResource, self).__init__()
-    self.created = False
+    self.created = user_managed
+    self.user_managed = user_managed
 
     # Creation and deletion time information
     # that we may make use of later.
@@ -41,6 +47,7 @@ class BaseResource(object):
     self.delete_start_time = None
     self.create_end_time = None
     self.delete_end_time = None
+    self.resource_ready_time = None
 
   @abc.abstractmethod
   def _Create(self):
@@ -65,6 +72,18 @@ class BaseResource(object):
     exceptions.
     """
     raise NotImplementedError()
+
+  def _IsReady(self):
+    """Return true if the underlying resource is ready.
+
+    Supplying this method is optional.  Use it when a resource can exist
+    without being ready.  If the subclass does not implement
+    it then it just returns true.
+
+    Returns:
+      True if the resource was ready in time, False if the wait timed out.
+    """
+    return True
 
   def _PostCreate(self):
     """Method that will be called once after _CreateReource is called.
@@ -126,11 +145,28 @@ class BaseResource(object):
 
   def Create(self):
     """Creates a resource and its dependencies."""
+
+    # A more general solution would allow the retry interval to be set as a
+    # property of the class.  We don't currently need that.
+    @vm_util.Retry(poll_interval=5, fuzz=0,
+                   retryable_exceptions=(
+                       errors.Resource.RetryableCreationError,))
+    def WaitUntilReady():
+      if not self._IsReady():
+        raise errors.Resource.RetryableCreationError('Not yet ready')
+
+    if self.user_managed:
+      return
     self._CreateDependencies()
     self._CreateResource()
+    WaitUntilReady()
+    if not self.resource_ready_time:
+      self.resource_ready_time = time.time()
     self._PostCreate()
 
   def Delete(self):
     """Deletes a resource and its dependencies."""
+    if self.user_managed:
+      return
     self._DeleteResource()
     self._DeleteDependencies()

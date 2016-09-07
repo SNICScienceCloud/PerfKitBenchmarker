@@ -31,6 +31,7 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import providers
+from perfkitbenchmarker import spark_service
 from perfkitbenchmarker import static_virtual_machine as static_vm
 from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
@@ -60,18 +61,18 @@ flags.DEFINE_enum('cloud', providers.GCP,
                   providers.VALID_CLOUDS,
                   'Name of the cloud to use.')
 flags.DEFINE_string('scratch_dir', None,
-                    'Base name for all scratch disk directories in the VM.'
-                    'Upon creation, these directories will have numbers'
+                    'Base name for all scratch disk directories in the VM. '
+                    'Upon creation, these directories will have numbers '
                     'appended to them (for example /scratch0, /scratch1, etc).')
 flags.DEFINE_enum('benchmark_compatibility_checking', SUPPORTED,
                   [SUPPORTED, NOT_EXCLUDED, SKIP_CHECK],
                   'Method used to check compatibility between the benchmark '
                   ' and the cloud.  ' + SUPPORTED + ' runs the benchmark only'
                   ' if the cloud provider has declared it supported. ' +
-                  NOT_EXCLUDED + ' runs the benchmark unless it has been '
-                  ' declared not supported by the could provider. ' +
+                  NOT_EXCLUDED + ' runs the benchmark unless it has been'
+                  ' declared not supported by the cloud provider. ' +
                   SKIP_CHECK + ' does not do the compatibility'
-                  ' check. The default is ' + SUPPORTED)
+                  ' check.')
 
 
 class BenchmarkSpec(object):
@@ -86,6 +87,7 @@ class BenchmarkSpec(object):
       benchmark_name: string. Name of the benchmark.
       benchmark_uid: An identifier unique to this run of the benchmark even
           if the same benchmark is run multiple times with different configs.
+      spark_service: The spark service configured for this benchmark.
     """
     self.config = benchmark_config
     self.name = benchmark_name
@@ -98,8 +100,11 @@ class BenchmarkSpec(object):
     self.vm_groups = {}
     self.deleted = False
     self.file_name = os.path.join(vm_util.GetTempDir(), self.uid)
-    self.uuid = str(uuid.uuid4())
+    self.uuid = '%s-%s' % (FLAGS.run_uri, uuid.uuid4())
     self.always_call_cleanup = False
+    self.spark_service = None
+
+    self._zone_index = 0
 
     # Set the current thread's BenchmarkSpec object to this one.
     context.SetThreadBenchmarkSpec(self)
@@ -118,7 +123,6 @@ class BenchmarkSpec(object):
   def ConstructVirtualMachineGroup(self, group_name, group_spec):
     """Construct the virtual machine(s) needed for a group."""
     vms = []
-    zone_index = 0
 
     vm_count = group_spec.vm_count
     disk_count = group_spec.disk_count
@@ -154,9 +158,10 @@ class BenchmarkSpec(object):
     for _ in xrange(vm_count - len(vms)):
       # Assign a zone to each VM sequentially from the --zones flag.
       if FLAGS.zones:
-        group_spec.vm_spec.zone = FLAGS.zones[zone_index]
-        zone_index = (zone_index + 1 if zone_index < len(FLAGS.zones) - 1
-                      else 0)
+        group_spec.vm_spec.zone = FLAGS.zones[self._zone_index]
+        self._zone_index = (self._zone_index + 1
+                            if self._zone_index < len(FLAGS.zones) - 1
+                            else 0)
       vm = self._CreateVirtualMachine(group_spec.vm_spec, os_type, cloud)
       if disk_spec:
         vm.disk_specs = [copy.copy(disk_spec) for _ in xrange(disk_count)]
@@ -228,6 +233,17 @@ class BenchmarkSpec(object):
       self.vm_groups[group_name] = vms
       self.vms.extend(vms)
 
+  def ConstructSparkService(self):
+    if self.config.spark_service is None:
+      return
+
+    providers.LoadProvider(self.config.spark_service.cloud)
+    spark_service_spec = self.config.spark_service
+    service_type = spark_service_spec.service_type
+    spark_service_class = spark_service.GetSparkServiceClass(
+        spark_service_spec.cloud, service_type)
+    self.spark_service = spark_service_class(spark_service_spec)
+
   def Prepare(self):
     targets = [(vm.PrepareBackgroundWorkload, (), {}) for vm in self.vms]
     vm_util.RunParallelThreads(targets, len(targets))
@@ -254,11 +270,15 @@ class BenchmarkSpec(object):
         sshable_vm_groups[group_name] = [vm for vm in group_vms
                                          if vm.OS_TYPE != os_types.WINDOWS]
       vm_util.GenerateSSHConfig(sshable_vms, sshable_vm_groups)
-
+    if self.spark_service:
+      self.spark_service.Create()
 
   def Delete(self):
     if self.deleted:
       return
+
+    if self.spark_service:
+      self.spark_service.Delete()
 
     if self.vms:
       try:
@@ -320,14 +340,22 @@ class BenchmarkSpec(object):
     Args:
         vm: The BaseVirtualMachine object representing the VM.
     """
+    vm_metadata = {'benchmark': self.name,
+                   'perfkit_uuid': self.uuid,
+                   'benchmark_uid': self.uid}
+    for item in FLAGS.vm_metadata:
+      if ':' not in item:
+        raise Exception('"%s" not in expected key:value format' % item)
+      key, value = item.split(':', 1)
+      vm_metadata[key] = value
+
     vm.Create()
 
     logging.info('VM: %s', vm.ip_address)
     logging.info('Waiting for boot completion.')
     vm.AllowRemoteAccessPorts()
     vm.WaitForBootCompletion()
-    vm.AddMetadata(benchmark=self.name, perfkit_uuid=self.uuid,
-                   benchmark_uid=self.uid)
+    vm.AddMetadata(**vm_metadata)
     vm.OnStartup()
     if any((spec.disk_type == disk.LOCAL for spec in vm.disk_specs)):
       vm.SetupLocalDisks()

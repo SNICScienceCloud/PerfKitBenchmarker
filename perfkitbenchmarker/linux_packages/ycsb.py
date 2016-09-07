@@ -1,4 +1,4 @@
-# Copyright 2015 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2016 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,8 +55,9 @@ from perfkitbenchmarker import vm_util
 
 FLAGS = flags.FLAGS
 
+YCSB_VERSION = '0.9.0'
 YCSB_TAR_URL = ('https://github.com/brianfrankcooper/YCSB/releases/'
-                'download/0.3.0/ycsb-0.3.0.tar.gz')
+                'download/{0}/ycsb-{0}.tar.gz').format(YCSB_VERSION)
 YCSB_DIR = posixpath.join(vm_util.VM_TMP_DIR, 'ycsb')
 YCSB_EXE = posixpath.join(YCSB_DIR, 'bin', 'ycsb')
 
@@ -143,7 +144,7 @@ def CheckPrerequisites():
 
 def _Install(vm):
   """Installs the YCSB package on the VM."""
-  vm.Install('openjdk7')
+  vm.Install('openjdk')
   vm.Install('curl')
   vm.RemoteCommand(('mkdir -p {0} && curl -L {1} | '
                     'tar -C {0} --strip-components=1 -xzf -').format(
@@ -197,20 +198,38 @@ def ParseResults(ycsb_result_string, data_type='histogram'):
         indicates that 530 ops took between 0ms and 1ms, and 1 took between
         19ms and 20ms. Empty bins are not reported.
   """
+
+  # TODO: YCSB 0.9.0 output client and command line string to stderr, so
+  # we need to support it in the future.
+  lines = []
+  client_string = 'YCSB'
+  command_line = 'unknown'
   fp = io.BytesIO(ycsb_result_string)
-  client_string = next(fp).strip()
-  if not client_string.startswith('YCSB Client 0.'):
+  result_string = next(fp).strip()
+
+  def IsHeadOfResults(line):
+      return line.startswith('YCSB Client 0.') or line.startswith('[OVERALL]')
+
+  while not IsHeadOfResults(result_string):
+    result_string = next(fp).strip()
+
+  if result_string.startswith('YCSB Client 0.'):
+    client_string = result_string
+    command_line = next(fp).strip()
+    if not command_line.startswith('Command line:'):
+      raise IOError('Unexpected second line: {0}'.format(command_line))
+  elif result_string.startswith('[OVERALL]'):  # YCSB > 0.7.0.
+    lines.append(result_string)
+  else:
+    # Received unexpected header
     raise IOError('Unexpected header: {0}'.format(client_string))
-  command_line = next(fp).strip()
-  if not command_line.startswith('Command line:'):
-    raise IOError('Unexpected second line: {0}'.format(command_line))
 
   # Some databases print additional output to stdout.
   # YCSB results start with [<OPERATION_NAME>];
   # filter to just those lines.
   def LineFilter(line):
     return re.search(r'^\[[A-Z]+\]', line) is not None
-  lines = itertools.ifilter(LineFilter, fp)
+  lines = itertools.chain(lines, itertools.ifilter(LineFilter, fp))
 
   r = csv.reader(lines)
 
@@ -223,6 +242,10 @@ def ParseResults(ycsb_result_string, data_type='histogram'):
 
   for operation, lines in by_operation:
     operation = operation[1:-1].lower()
+
+    if operation == 'cleanup':
+      continue
+
     op_result = {
         'group': operation,
         data_type: [],
@@ -486,6 +509,9 @@ class YCSBExecutor(object):
       scanlengthdistribution: str.
       insertorder: str.
       hotspotdatafraction: float.
+      perclientparam: list.
+      shardkeyspace: boolean. Default to False, indicates if clients should
+      have their own keyspace.
   """
 
   FLAG_ATTRIBUTES = 'cp', 'jvm-args', 'target', 'threads'
@@ -494,6 +520,10 @@ class YCSBExecutor(object):
     self.database = database
     self.parameter_files = parameter_files or []
     self.parameters = kwargs.copy()
+    # Self-defined parameters, pop them out of self.parameters, so they
+    # are not passed to ycsb commands
+    self.perclientparam = self.parameters.pop('perclientparam', None)
+    self.shardkeyspace = self.parameters.pop('shardkeyspace', False)
 
   def _BuildCommand(self, command_name, parameter_files=None, **kwargs):
     command = [YCSB_EXE, command_name, self.database]
@@ -514,6 +544,7 @@ class YCSBExecutor(object):
     for parameter, value in parameters.iteritems():
       command.extend(('-p', '{0}={1}'.format(parameter, value)))
 
+    command.append('-p measurementtype=histogram')
     return 'cd %s; %s' % (YCSB_DIR, ' '.join(command))
 
   @property
@@ -559,6 +590,7 @@ class YCSBExecutor(object):
                            clients=len(vms) * kwargs['threads'],
                            threads_per_client_vm=kwargs['threads'],
                            workload_name=os.path.basename(workload_file))
+      self.workload_meta = workload_meta
     record_count = int(workload_meta.get('recordcount', '1000'))
     n_per_client = long(record_count) // len(vms)
     loader_counts = [n_per_client +
@@ -573,9 +605,11 @@ class YCSBExecutor(object):
 
     def _Load(loader_index):
       start = sum(loader_counts[:loader_index])
-      kw = kwargs.copy()
+      kw = copy.deepcopy(kwargs)
       kw.update(insertstart=start,
                 insertcount=loader_counts[loader_index])
+      if self.perclientparam is not None:
+        kw.update(self.perclientparam[loader_index])
       results.append(self._Load(vms[loader_index], **kw))
       logging.info('VM %d (%s) finished', loader_index, vms[loader_index])
 
@@ -607,8 +641,11 @@ class YCSBExecutor(object):
       param, value = pv.split('=', 1)
       kwargs[param] = value
     command = self._BuildCommand('run', **kwargs)
-    stdout, _ = vm.RobustRemoteCommand(command)
-    return ParseResults(str(stdout))
+    # YCSB version greater than 0.7.0 output some of the
+    # info we need to stderr. So we have to combine these 2
+    # output to get expected results.
+    stdout, stderr = vm.RobustRemoteCommand(command)
+    return ParseResults(str(stderr + stdout))
 
   def _RunThreaded(self, vms, **kwargs):
     """Run a single workload using `vms`."""
@@ -623,10 +660,25 @@ class YCSBExecutor(object):
 
     results = []
 
+    if self.shardkeyspace:
+      record_count = int(self.workload_meta.get('recordcount', '1000'))
+      n_per_client = long(record_count) // len(vms)
+      loader_counts = [n_per_client +
+                       (1 if i < (record_count % len(vms)) else 0)
+                       for i in xrange(len(vms))]
+
     def _Run(loader_index):
       vm = vms[loader_index]
-      kwargs['target'] = targets[loader_index]
-      results.append(self._Run(vm, **kwargs))
+      params = copy.deepcopy(kwargs)
+      params['target'] = targets[loader_index]
+      if self.perclientparam is not None:
+        params.update(self.perclientparam[loader_index])
+      if self.shardkeyspace:
+        start = sum(loader_counts[:loader_index])
+        end = start + loader_counts[loader_index]
+        params.update(insertstart=start,
+                      recordcount=end)
+      results.append(self._Run(vm, **params))
       logging.info('VM %d (%s) finished', loader_index, vm)
     vm_util.RunThreaded(_Run, range(len(vms)))
 

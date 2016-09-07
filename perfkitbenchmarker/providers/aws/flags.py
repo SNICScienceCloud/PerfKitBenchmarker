@@ -20,3 +20,12 @@ flags.DEFINE_string('aws_user_name', 'ubuntu',
                     'use any image other than ubuntu.')
 flags.DEFINE_integer('aws_provisioned_iops', None,
                      'IOPS for Provisioned IOPS (SSD) volumes in AWS.')
+
+flags.DEFINE_string('aws_emr_loguri', None,
+                    'The log-uri parameter to pass to AWS when creating a '
+                    'cluster.  If not set, a bucket will be created.')
+
+flags.DEFINE_string('s3_custom_endpoint', None,
+                    'If given, a custom endpoint to use for S3 transfers. If '
+                    'this flag is not given, use the standard endpoint for the '
+                    'storage region.')
